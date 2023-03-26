@@ -71,6 +71,7 @@ func Run(stdin io.Reader, stderr io.Writer, event, dataStore, cniPath, cniNetcon
 		return errors.New("state dir must be set")
 	}
 	if err := os.MkdirAll(containerStateDir, 0700); err != nil {
+		fmt.Println("@@@@@@@@@@@ 1")
 		return fmt.Errorf("failed to create %q: %w", containerStateDir, err)
 	}
 	logFilePath := filepath.Join(containerStateDir, "oci-hook."+event+".log")
