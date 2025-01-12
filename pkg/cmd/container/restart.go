@@ -20,10 +20,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/containerutil"
-	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
+	containerd "github.com/containerd/containerd/v2/client"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/idutil/containerwalker"
 )
 
 // Restart will restart one or more containers.
@@ -37,10 +38,10 @@ func Restart(ctx context.Context, client *containerd.Client, containers []string
 			if err := containerutil.Stop(ctx, found.Container, options.Timeout); err != nil {
 				return err
 			}
-			if err := containerutil.Start(ctx, found.Container, false, client); err != nil {
+			if err := containerutil.Start(ctx, found.Container, false, client, ""); err != nil {
 				return err
 			}
-			_, err := fmt.Fprintf(options.Stdout, "%s\n", found.Req)
+			_, err := fmt.Fprintln(options.Stdout, found.Req)
 			return err
 		},
 	}

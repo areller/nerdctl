@@ -23,28 +23,58 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"syscall"
 
 	"github.com/Masterminds/semver/v3"
-	"github.com/containerd/console"
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/nerdctl/pkg/infoutil"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/term"
+
+	"github.com/containerd/console"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/cioutil"
+	"github.com/containerd/nerdctl/v2/pkg/consoleutil"
+	"github.com/containerd/nerdctl/v2/pkg/infoutil"
 )
 
 // NewTask is from https://github.com/containerd/containerd/blob/v1.4.3/cmd/ctr/commands/tasks/tasks_unix.go#L70-L108
 func NewTask(ctx context.Context, client *containerd.Client, container containerd.Container,
-	flagA, flagI, flagT, flagD bool, con console.Console, logURI string) (containerd.Task, error) {
+	attachStreamOpt []string, flagI, flagT, flagD bool, con console.Console, logURI, detachKeys, namespace string, detachC chan<- struct{}) (containerd.Task, error) {
+
+	var t containerd.Task
+	closer := func() {
+		if detachC != nil {
+			detachC <- struct{}{}
+		}
+		// t will be set by container.NewTask at the end of this function.
+		//
+		// We cannot use container.Task(ctx, cio.Load) to get the IO here
+		// because the `cancel` field of the returned `*cio` is nil. [1]
+		//
+		// [1] https://github.com/containerd/containerd/blob/8f756bc8c26465bd93e78d9cd42082b66f276e10/cio/io.go#L358-L359
+		io := t.IO()
+		if io == nil {
+			log.G(ctx).Errorf("got a nil io")
+			return
+		}
+		io.Cancel()
+	}
 	var ioCreator cio.Creator
-	if flagA {
-		logrus.Debug("attaching output instead of using the log-uri")
+	if len(attachStreamOpt) != 0 {
+		log.G(ctx).Debug("attaching output instead of using the log-uri")
 		if flagT {
-			ioCreator = cio.NewCreator(cio.WithStreams(con, con, nil), cio.WithTerminal)
+			in, err := consoleutil.NewDetachableStdin(con, detachKeys, closer)
+			if err != nil {
+				return nil, err
+			}
+			ioCreator = cio.NewCreator(cio.WithStreams(in, con, nil), cio.WithTerminal)
 		} else {
-			ioCreator = cio.NewCreator(cio.WithStdio)
+			streams := processAttachStreamsOpt(attachStreamOpt)
+			ioCreator = cio.NewCreator(cio.WithStreams(streams.stdIn, streams.stdOut, streams.stdErr))
 		}
 
 	} else if flagT && flagD {
@@ -66,7 +96,12 @@ func NewTask(ctx context.Context, client *containerd.Client, container container
 		if len(args) != 2 {
 			return nil, errors.New("parse logging path error")
 		}
-		ioCreator = cio.TerminalBinaryIO(u.Path, map[string]string{
+		parsedPath := u.Path
+		// For Windows, remove the leading slash
+		if (runtime.GOOS == "windows") && (strings.HasPrefix(parsedPath, "/")) {
+			parsedPath = strings.TrimLeft(parsedPath, "/")
+		}
+		ioCreator = cio.TerminalBinaryIO(parsedPath, map[string]string{
 			args[0]: args[1],
 		})
 	} else if flagT && !flagD {
@@ -79,11 +114,14 @@ func NewTask(ctx context.Context, client *containerd.Client, container container
 			if runtime.GOOS != "windows" && !term.IsTerminal(0) {
 				return nil, errors.New("the input device is not a TTY")
 			}
-			in = con
+			var err error
+			in, err = consoleutil.NewDetachableStdin(con, detachKeys, closer)
+			if err != nil {
+				return nil, err
+			}
 		}
-		ioCreator = cio.NewCreator(cio.WithStreams(in, os.Stdout, nil), cio.WithTerminal)
+		ioCreator = cioutil.NewContainerIO(namespace, logURI, true, in, os.Stdout, os.Stderr)
 	} else if flagD && logURI != "" {
-		// TODO: support logURI for `nerdctl run -it`
 		u, err := url.Parse(logURI)
 		if err != nil {
 			return nil, err
@@ -93,15 +131,15 @@ func NewTask(ctx context.Context, client *containerd.Client, container container
 		var in io.Reader
 		if flagI {
 			if sv, err := infoutil.ServerSemVer(ctx, client); err != nil {
-				logrus.Warn(err)
+				log.G(ctx).Warn(err)
 			} else if sv.LessThan(semver.MustParse("1.6.0-0")) {
-				logrus.Warnf("`nerdctl (run|exec) -i` without `-t` expects containerd 1.6 or later, got containerd %v", sv)
+				log.G(ctx).Warnf("`nerdctl (run|exec) -i` without `-t` expects containerd 1.6 or later, got containerd %v", sv)
 			}
 			var stdinC io.ReadCloser = &StdinCloser{
 				Stdin: os.Stdin,
 				Closer: func() {
 					if t, err := container.Task(ctx, nil); err != nil {
-						logrus.WithError(err).Debugf("failed to get task for StdinCloser")
+						log.G(ctx).WithError(err).Debugf("failed to get task for StdinCloser")
 					} else {
 						t.CloseIO(ctx, containerd.WithStdinCloser)
 					}
@@ -109,13 +147,58 @@ func NewTask(ctx context.Context, client *containerd.Client, container container
 			}
 			in = stdinC
 		}
-		ioCreator = cio.NewCreator(cio.WithStreams(in, os.Stdout, os.Stderr))
+		ioCreator = cioutil.NewContainerIO(namespace, logURI, false, in, os.Stdout, os.Stderr)
 	}
 	t, err := container.NewTask(ctx, ioCreator)
 	if err != nil {
 		return nil, err
 	}
 	return t, nil
+}
+
+// struct used to store streams specified with attachStreamOpt (-a, --attach)
+type streams struct {
+	stdIn  *os.File
+	stdOut *os.File
+	stdErr *os.File
+}
+
+func nullStream() *os.File {
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		return nil
+	}
+	defer devNull.Close()
+
+	return devNull
+}
+
+func processAttachStreamsOpt(streamsArr []string) streams {
+	stdIn := os.Stdin
+	stdOut := os.Stdout
+	stdErr := os.Stderr
+
+	for i, str := range streamsArr {
+		streamsArr[i] = strings.ToUpper(str)
+	}
+
+	if !slices.Contains(streamsArr, "STDIN") {
+		stdIn = nullStream()
+	}
+
+	if !slices.Contains(streamsArr, "STDOUT") {
+		stdOut = nullStream()
+	}
+
+	if !slices.Contains(streamsArr, "STDERR") {
+		stdErr = nullStream()
+	}
+
+	return streams{
+		stdIn:  stdIn,
+		stdOut: stdOut,
+		stdErr: stdErr,
+	}
 }
 
 // StdinCloser is from https://github.com/containerd/containerd/blob/v1.4.3/cmd/ctr/commands/tasks/exec.go#L181-L194

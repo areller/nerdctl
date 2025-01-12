@@ -17,7 +17,6 @@
 package jsonfile
 
 import (
-	"container/ring"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,7 +28,7 @@ import (
 
 	timetypes "github.com/docker/docker/api/types/time"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
 )
 
 // Entry is compatible with Docker "json-file" logs
@@ -54,14 +53,14 @@ func Encode(stdout <-chan string, stderr <-chan string, writer io.Writer) error 
 		e := &Entry{
 			Stream: name,
 		}
-		for log := range dataChan {
-			e.Log = log + "\n"
+		for logEntry := range dataChan {
+			e.Log = logEntry + "\n"
 			e.Time = time.Now().UTC()
 			encMu.Lock()
 			encErr := enc.Encode(e)
 			encMu.Unlock()
 			if encErr != nil {
-				logrus.WithError(encErr).Errorf("failed to encode JSON")
+				log.L.WithError(encErr).Errorf("failed to encode JSON")
 				return
 			}
 		}
@@ -119,7 +118,7 @@ func writeEntry(e *Entry, stdout, stderr io.Writer, refTime time.Time, timestamp
 	case "stderr":
 		writeTo = stderr
 	default:
-		logrus.Errorf("unknown stream name %q, entry=%+v", e.Stream, e)
+		log.L.Errorf("unknown stream name %q, entry=%+v", e.Stream, e)
 	}
 
 	if writeTo != nil {
@@ -129,12 +128,7 @@ func writeEntry(e *Entry, stdout, stderr io.Writer, refTime time.Time, timestamp
 	return nil
 }
 
-func Decode(stdout, stderr io.Writer, r io.Reader, timestamps bool, since string, until string, tail uint) error {
-	var buff *ring.Ring
-	if tail != 0 {
-		buff = ring.New(int(tail))
-	}
-
+func Decode(stdout, stderr io.Writer, r io.Reader, timestamps bool, since string, until string) ([]byte, error) {
 	dec := json.NewDecoder(r)
 	now := time.Now()
 	for {
@@ -142,41 +136,19 @@ func Decode(stdout, stderr io.Writer, r io.Reader, timestamps bool, since string
 		if err := dec.Decode(&e); err == io.EOF {
 			break
 		} else if err != nil {
-			return err
+			line, err := io.ReadAll(dec.Buffered())
+			if err != nil {
+				return nil, err
+			}
+			return line, err
 		}
 
-		if buff == nil {
-			// Write out the entry directly
-			err := writeEntry(&e, stdout, stderr, now, timestamps, since, until)
-			if err != nil {
-				logrus.Errorf("error while writing log entry to output stream: %s", err)
-			}
-		} else {
-			// Else place the entry in a ring buffer
-			buff.Value = &e
-			buff = buff.Next()
+		// Write out the entry directly
+		err := writeEntry(&e, stdout, stderr, now, timestamps, since, until)
+		if err != nil {
+			log.L.Errorf("error while writing log entry to output stream: %s", err)
 		}
 	}
 
-	if buff != nil {
-		// The ring should now contain up to `tail` elements and be set to
-		// internally point to the oldest element in the ring.
-		buff.Do(func(e interface{}) {
-			if e == nil {
-				// unallocated ring element
-				return
-			}
-			cast, ok := e.(*Entry)
-			if !ok {
-				logrus.Errorf("failed to cast Entry struct: %#v", e)
-				return
-			}
-
-			err := writeEntry(cast, stdout, stderr, now, timestamps, since, until)
-			if err != nil {
-				logrus.Errorf("error while writing log entry to output stream: %s", err)
-			}
-		})
-	}
-	return nil
+	return nil, nil
 }

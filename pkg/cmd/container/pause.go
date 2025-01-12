@@ -20,10 +20,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/containerutil"
-	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
+	containerd "github.com/containerd/containerd/v2/client"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/idutil/containerwalker"
 )
 
 // Pause pauses all containers specified by `reqs`.
@@ -38,7 +39,7 @@ func Pause(ctx context.Context, client *containerd.Client, reqs []string, option
 				return err
 			}
 
-			_, err := fmt.Fprintf(options.Stdout, "%s\n", found.Req)
+			_, err := fmt.Fprintln(options.Stdout, found.Req)
 			return err
 		},
 	}

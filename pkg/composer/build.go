@@ -21,10 +21,11 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/compose-spec/compose-go/types"
-	"github.com/containerd/nerdctl/pkg/composer/serviceparser"
+	"github.com/compose-spec/compose-go/v2/types"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/composer/serviceparser"
 )
 
 type BuildOptions struct {
@@ -34,8 +35,8 @@ type BuildOptions struct {
 }
 
 func (c *Composer) Build(ctx context.Context, bo BuildOptions, services []string) error {
-	return c.project.WithServices(services, func(svc types.ServiceConfig) error {
-		ps, err := serviceparser.Parse(c.project, svc)
+	return c.project.ForEachService(services, func(names string, svc *types.ServiceConfig) error {
+		ps, err := serviceparser.Parse(c.project, *svc)
 		if err != nil {
 			return err
 		}
@@ -43,11 +44,11 @@ func (c *Composer) Build(ctx context.Context, bo BuildOptions, services []string
 			return c.buildServiceImage(ctx, ps.Image, ps.Build, ps.Unparsed.Platform, bo)
 		}
 		return nil
-	})
+	}, types.IgnoreDependencies)
 }
 
 func (c *Composer) buildServiceImage(ctx context.Context, image string, b *serviceparser.Build, platform string, bo BuildOptions) error {
-	logrus.Infof("Building image %s", image)
+	log.G(ctx).Infof("Building image %s", image)
 
 	var args []string // nolint: prealloc
 	if platform != "" {
@@ -66,7 +67,7 @@ func (c *Composer) buildServiceImage(ctx context.Context, image string, b *servi
 
 	cmd := c.createNerdctlCmd(ctx, append([]string{"build"}, args...)...)
 	if c.DebugPrintFull {
-		logrus.Debugf("Running %v", cmd.Args)
+		log.G(ctx).Debugf("Running %v", cmd.Args)
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

@@ -20,13 +20,14 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/cmd/builder"
-	"github.com/containerd/nerdctl/pkg/cmd/container"
-	"github.com/containerd/nerdctl/pkg/cmd/image"
-	"github.com/containerd/nerdctl/pkg/cmd/network"
-	"github.com/containerd/nerdctl/pkg/cmd/volume"
+	containerd "github.com/containerd/containerd/v2/client"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/cmd/builder"
+	"github.com/containerd/nerdctl/v2/pkg/cmd/container"
+	"github.com/containerd/nerdctl/v2/pkg/cmd/image"
+	"github.com/containerd/nerdctl/v2/pkg/cmd/network"
+	"github.com/containerd/nerdctl/v2/pkg/cmd/volume"
 )
 
 // Prune will remove all unused containers, networks,
@@ -48,6 +49,7 @@ func Prune(ctx context.Context, client *containerd.Client, options types.SystemP
 	if options.Volumes {
 		if err := volume.Prune(ctx, client, types.VolumePruneOptions{
 			GOptions: options.GOptions,
+			All:      false,
 			Force:    true,
 			Stdout:   options.Stdout,
 		}); err != nil {
@@ -61,20 +63,23 @@ func Prune(ctx context.Context, client *containerd.Client, options types.SystemP
 	}); err != nil {
 		return nil
 	}
-	prunedObjects, err := builder.Prune(ctx, types.BuilderPruneOptions{
-		Stderr:       options.Stderr,
-		GOptions:     options.GOptions,
-		All:          options.All,
-		BuildKitHost: options.BuildKitHost,
-	})
-	if err != nil {
-		return err
-	}
 
-	if len(prunedObjects) > 0 {
-		fmt.Fprintln(options.Stdout, "Deleted build cache objects:")
-		for _, item := range prunedObjects {
-			fmt.Fprintln(options.Stdout, item.ID)
+	if options.BuildKitHost != "" {
+		prunedObjects, err := builder.Prune(ctx, types.BuilderPruneOptions{
+			Stderr:       options.Stderr,
+			GOptions:     options.GOptions,
+			All:          options.All,
+			BuildKitHost: options.BuildKitHost,
+		})
+		if err != nil {
+			return err
+		}
+
+		if len(prunedObjects) > 0 {
+			fmt.Fprintln(options.Stdout, "Deleted build cache objects:")
+			for _, item := range prunedObjects {
+				fmt.Fprintln(options.Stdout, item.ID)
+			}
 		}
 	}
 

@@ -1,4 +1,4 @@
-//go:build freebsd || linux
+//go:build unix
 
 /*
    Copyright The containerd Authors.
@@ -23,7 +23,6 @@ import (
 	"io"
 	"os"
 	"regexp"
-
 	"strings"
 
 	"golang.org/x/sys/unix"

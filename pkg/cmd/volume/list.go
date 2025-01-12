@@ -25,11 +25,12 @@ import (
 	"text/tabwriter"
 	"text/template"
 
-	"github.com/containerd/containerd/pkg/progress"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/formatter"
-	"github.com/containerd/nerdctl/pkg/inspecttypes/native"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/containerd/v2/pkg/progress"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/formatter"
+	"github.com/containerd/nerdctl/v2/pkg/inspecttypes/native"
 )
 
 type volumePrintable struct {
@@ -44,16 +45,16 @@ type volumePrintable struct {
 
 func List(options types.VolumeListOptions) error {
 	if options.Quiet && options.Size {
-		logrus.Warn("cannot use --size and --quiet together, ignoring --size")
+		log.L.Warn("cannot use --size and --quiet together, ignoring --size")
 		options.Size = false
 	}
 	sizeFilter := hasSizeFilter(options.Filters)
 	if sizeFilter && options.Quiet {
-		logrus.Warn("cannot use --filter=size and --quiet together, ignoring --filter=size")
+		log.L.Warn("cannot use --filter=size and --quiet together, ignoring --filter=size")
 		options.Filters = removeSizeFilters(options.Filters)
 	}
 	if sizeFilter && !options.Size {
-		logrus.Warn("should use --filter=size and --size together")
+		log.L.Warn("should use --filter=size and --size together")
 		options.Size = true
 	}
 
@@ -134,7 +135,7 @@ func lsPrintOutput(vols map[string]native.Volume, options types.VolumeListOption
 			if err := tmpl.Execute(&b, p); err != nil {
 				return err
 			}
-			if _, err := fmt.Fprintf(w, b.String()+"\n"); err != nil {
+			if _, err := fmt.Fprintln(w, b.String()); err != nil {
 				return err
 			}
 		} else if options.Quiet {
@@ -268,15 +269,28 @@ func volumeMatchesFilter(vol native.Volume, labelFilterFuncs []func(*map[string]
 			return false
 		}
 	}
-	for _, nameFilterFunc := range nameFilterFuncs {
-		if !nameFilterFunc(vol.Name) {
-			return false
-		}
+
+	if !anyMatch(vol.Name, nameFilterFuncs) {
+		return false
 	}
+
 	for _, sizeFilterFunc := range sizeFilterFuncs {
 		if !sizeFilterFunc(vol.Size) {
 			return false
 		}
 	}
+
 	return true
+}
+
+func anyMatch[T any](vol T, filters []func(T) bool) bool {
+	if len(filters) == 0 {
+		return true
+	}
+	for _, f := range filters {
+		if f(vol) {
+			return true
+		}
+	}
+	return false
 }

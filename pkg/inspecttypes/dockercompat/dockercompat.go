@@ -35,41 +35,53 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/runtime/restart"
-	gocni "github.com/containerd/go-cni"
-	"github.com/containerd/nerdctl/pkg/imgutil"
-	"github.com/containerd/nerdctl/pkg/inspecttypes/native"
-	"github.com/containerd/nerdctl/pkg/labels"
 	"github.com/docker/go-connections/nat"
 	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/runtime/restart"
+	"github.com/containerd/go-cni"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/imgutil"
+	"github.com/containerd/nerdctl/v2/pkg/inspecttypes/native"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
+	"github.com/containerd/nerdctl/v2/pkg/ocihook/state"
 )
 
-// Image mimics a `docker image inspect` object.
-// From https://github.com/moby/moby/blob/v20.10.1/api/types/types.go#L340-L374
+// From https://github.com/moby/moby/blob/v26.1.2/api/types/types.go#L34-L140
 type Image struct {
-	ID          string `json:"Id"`
-	RepoTags    []string
-	RepoDigests []string
-	// TODO: Parent      string
-	Comment string
-	Created string
-	// TODO: Container   string
-	// TODO: ContainerConfig *container.Config
-	// TODO: DockerVersion string
-	Author       string
-	Config       *Config
-	Architecture string
-	// TODO: Variant       string `json:",omitempty"`
-	Os string
+	ID            string `json:"Id"`
+	RepoTags      []string
+	RepoDigests   []string
+	Parent        string
+	Comment       string
+	Created       string
+	DockerVersion string
+	Author        string
+	Config        *Config
+	Architecture  string
+	Variant       string `json:",omitempty"`
+	Os            string
+
 	// TODO: OsVersion     string `json:",omitempty"`
-	Size int64 // Size is the unpacked size of the image
-	// TODO: VirtualSize   int64
-	// TODO: GraphDriver     GraphDriverData
+
+	Size        int64 // Size is the unpacked size of the image
+	VirtualSize int64 `json:"VirtualSize,omitempty"` // Deprecated
+
+	// TODO: GraphDriver	GraphDriverData
+
 	RootFS   RootFS
 	Metadata ImageMetadata
+
+	// Deprecated: TODO: Container   string
+	// Deprecated: TODO: ContainerConfig *container.Config
+}
+
+// From: https://github.com/moby/moby/blob/v26.1.2/api/types/graph_driver_data.go
+type GraphDriverData struct {
+	Data map[string]string `json:"Data"`
+	Name string            `json:"Name"`
 }
 
 type RootFS struct {
@@ -106,8 +118,8 @@ type Container struct {
 	// TODO: ExecIDs         []string
 	// TODO: HostConfig      *container.HostConfig
 	// TODO: GraphDriver     GraphDriverData
-	// TODO: SizeRw     *int64 `json:",omitempty"`
-	// TODO: SizeRootFs *int64 `json:",omitempty"`
+	SizeRw     *int64 `json:",omitempty"`
+	SizeRootFs *int64 `json:",omitempty"`
 
 	Mounts          []MountPoint
 	Config          *Config
@@ -165,16 +177,16 @@ type ContainerState struct {
 	Restarting bool
 	// TODO: OOMKilled  bool
 	// TODO:	Dead       bool
-	Pid      int
-	ExitCode int
-	Error    string
-	// TODO: StartedAt  string
+	Pid        int
+	ExitCode   int
+	Error      string
+	StartedAt  string
 	FinishedAt string
 	// TODO: Health     *Health `json:",omitempty"`
 }
 
 type NetworkSettings struct {
-	Ports *nat.PortMap `json:",omitempty"`
+	Ports *nat.PortMap
 	DefaultNetworkSettings
 	Networks map[string]*NetworkEndpointSettings
 }
@@ -212,18 +224,22 @@ type NetworkEndpointSettings struct {
 
 // ContainerFromNative instantiates a Docker-compatible Container from containerd-native Container.
 func ContainerFromNative(n *native.Container) (*Container, error) {
+	var hostname string
 	c := &Container{
-		ID:       n.ID,
-		Created:  n.CreatedAt.Format(time.RFC3339Nano),
-		Image:    n.Image,
-		Name:     n.Labels[labels.Name],
-		Driver:   n.Snapshotter,
+		ID:      n.ID,
+		Created: n.CreatedAt.Format(time.RFC3339Nano),
+		Image:   n.Image,
+		Name:    n.Labels[labels.Name],
+		Driver:  n.Snapshotter,
+		// XXX is this always right? what if the container OS is NOT the same as the host OS?
 		Platform: runtime.GOOS, // for Docker compatibility, this Platform string does NOT contain arch like "/amd64"
 	}
 	if n.Labels[restart.StatusLabel] == string(containerd.Running) {
 		c.RestartCount, _ = strconv.Atoi(n.Labels[restart.CountLabel])
 	}
+	containerAnnotations := make(map[string]string)
 	if sp, ok := n.Spec.(*specs.Spec); ok {
+		containerAnnotations = sp.Annotations
 		if p := sp.Process; p != nil {
 			if len(p.Args) > 0 {
 				c.Path = p.Args[0]
@@ -233,15 +249,24 @@ func ContainerFromNative(n *native.Container) (*Container, error) {
 			}
 			c.AppArmorProfile = p.ApparmorProfile
 		}
+		c.Mounts = mountsFromNative(sp.Mounts)
+		for _, mount := range c.Mounts {
+			if mount.Destination == "/etc/resolv.conf" {
+				c.ResolvConfPath = mount.Source
+			} else if mount.Destination == "/etc/hostname" {
+				c.HostnamePath = mount.Source
+			}
+		}
+		hostname = sp.Hostname
 	}
 	if nerdctlStateDir := n.Labels[labels.StateDir]; nerdctlStateDir != "" {
-		c.ResolvConfPath = filepath.Join(nerdctlStateDir, "resolv.conf")
-		if _, err := os.Stat(c.ResolvConfPath); err != nil {
-			c.ResolvConfPath = ""
+		resolvConfPath := filepath.Join(nerdctlStateDir, "resolv.conf")
+		if _, err := os.Stat(resolvConfPath); err == nil {
+			c.ResolvConfPath = resolvConfPath
 		}
-		c.HostnamePath = filepath.Join(nerdctlStateDir, "hostname")
-		if _, err := os.Stat(c.HostnamePath); err != nil {
-			c.HostnamePath = ""
+		hostnamePath := filepath.Join(nerdctlStateDir, "hostname")
+		if _, err := os.Stat(hostnamePath); err == nil {
+			c.HostnamePath = hostnamePath
 		}
 		c.LogPath = filepath.Join(nerdctlStateDir, n.ID+"-json.log")
 		if _, err := os.Stat(c.LogPath); err != nil {
@@ -266,7 +291,18 @@ func ContainerFromNative(n *native.Container) (*Container, error) {
 		cs.Paused = n.Process.Status.Status == containerd.Paused
 		cs.Pid = n.Process.Pid
 		cs.ExitCode = int(n.Process.Status.ExitStatus)
-		cs.FinishedAt = n.Process.Status.ExitTime.Format(time.RFC3339Nano)
+		if containerAnnotations[labels.StateDir] != "" {
+			if lf, err := state.New(containerAnnotations[labels.StateDir]); err != nil {
+				log.L.WithError(err).Errorf("failed retrieving state")
+			} else if err = lf.Load(); err != nil {
+				log.L.WithError(err).Errorf("failed retrieving StartedAt from state")
+			} else if !time.Time.IsZero(lf.StartedAt) {
+				cs.StartedAt = lf.StartedAt.UTC().Format(time.RFC3339Nano)
+			}
+		}
+		if !n.Process.Status.ExitTime.IsZero() {
+			cs.FinishedAt = n.Process.Status.ExitTime.Format(time.RFC3339Nano)
+		}
 		nSettings, err := networkSettingsFromNative(n.Process.NetNS, n.Spec.(*specs.Spec))
 		if err != nil {
 			return nil, err
@@ -275,56 +311,83 @@ func ContainerFromNative(n *native.Container) (*Container, error) {
 	}
 	c.State = cs
 	c.Config = &Config{
-		Hostname: n.Labels[labels.Hostname],
-		Labels:   n.Labels,
+		Labels: n.Labels,
 	}
+	if n.Labels[labels.Hostname] != "" {
+		hostname = n.Labels[labels.Hostname]
+	}
+	c.Config.Hostname = hostname
 
 	return c, nil
 }
 
-func ImageFromNative(n *native.Image) (*Image, error) {
-	i := &Image{}
+func ImageFromNative(nativeImage *native.Image) (*Image, error) {
+	imgOCI := nativeImage.ImageConfig
+	repository, tag := imgutil.ParseRepoTag(nativeImage.Image.Name)
 
-	imgoci := n.ImageConfig
+	image := &Image{
+		// Docker ID (digest of platform-specific config), not containerd ID (digest of multi-platform index or manifest)
+		ID:           nativeImage.ImageConfigDesc.Digest.String(),
+		Parent:       nativeImage.Image.Labels["org.mobyproject.image.parent"],
+		Architecture: imgOCI.Architecture,
+		Variant:      imgOCI.Platform.Variant,
+		Os:           imgOCI.OS,
+		Size:         nativeImage.Size,
+		VirtualSize:  nativeImage.Size,
+		RepoTags:     []string{fmt.Sprintf("%s:%s", repository, tag)},
+		RepoDigests:  []string{fmt.Sprintf("%s@%s", repository, nativeImage.Image.Target.Digest.String())},
+	}
 
-	i.RootFS.Type = imgoci.RootFS.Type
-	diffIDs := imgoci.RootFS.DiffIDs
-	for _, d := range diffIDs {
-		i.RootFS.Layers = append(i.RootFS.Layers, d.String())
+	if len(imgOCI.History) > 0 {
+		image.Comment = imgOCI.History[len(imgOCI.History)-1].Comment
+		image.Created = imgOCI.History[len(imgOCI.History)-1].Created.Format(time.RFC3339Nano)
+		image.Author = imgOCI.History[len(imgOCI.History)-1].Author
 	}
-	if len(imgoci.History) > 0 {
-		i.Comment = imgoci.History[len(imgoci.History)-1].Comment
-		i.Created = imgoci.History[len(imgoci.History)-1].Created.Format(time.RFC3339Nano)
-		i.Author = imgoci.History[len(imgoci.History)-1].Author
+
+	image.RootFS.Type = imgOCI.RootFS.Type
+	for _, d := range imgOCI.RootFS.DiffIDs {
+		image.RootFS.Layers = append(image.RootFS.Layers, d.String())
 	}
-	i.Architecture = imgoci.Architecture
-	i.Os = imgoci.OS
 
 	portSet := make(nat.PortSet)
-	for k := range imgoci.Config.ExposedPorts {
+	for k := range imgOCI.Config.ExposedPorts {
 		portSet[nat.Port(k)] = struct{}{}
 	}
 
-	i.Config = &Config{
-		Cmd:          imgoci.Config.Cmd,
-		Volumes:      imgoci.Config.Volumes,
-		Env:          imgoci.Config.Env,
-		User:         imgoci.Config.User,
-		WorkingDir:   imgoci.Config.WorkingDir,
-		Entrypoint:   imgoci.Config.Entrypoint,
-		Labels:       imgoci.Config.Labels,
+	image.Config = &Config{
+		Cmd:          imgOCI.Config.Cmd,
+		Volumes:      imgOCI.Config.Volumes,
+		Env:          imgOCI.Config.Env,
+		User:         imgOCI.Config.User,
+		WorkingDir:   imgOCI.Config.WorkingDir,
+		Entrypoint:   imgOCI.Config.Entrypoint,
+		Labels:       imgOCI.Config.Labels,
 		ExposedPorts: portSet,
 	}
 
-	i.ID = n.ImageConfigDesc.Digest.String() // Docker ID (digest of platform-specific config), not containerd ID (digest of multi-platform index or manifest)
-
-	repository, tag := imgutil.ParseRepoTag(n.Image.Name)
-
-	i.RepoTags = []string{fmt.Sprintf("%s:%s", repository, tag)}
-	i.RepoDigests = []string{fmt.Sprintf("%s@%s", repository, n.Image.Target.Digest.String())}
-	i.Size = n.Size
-	return i, nil
+	return image, nil
 }
+
+// mountsFromNative only filters bind mount to transform from native container.
+// Because native container shows all types of mounts, such as tmpfs, proc, sysfs.
+func mountsFromNative(spMounts []specs.Mount) []MountPoint {
+	mountpoints := make([]MountPoint, 0, len(spMounts))
+	for _, m := range spMounts {
+		var mp MountPoint
+		if m.Type != "bind" {
+			continue
+		}
+		mp.Type = m.Type
+		mp.Source = m.Source
+		mp.Destination = m.Destination
+		mp.Mode = strings.Join(m.Options, ",")
+		mp.RW, mp.Propagation = ParseMountProperties(m.Options)
+		mountpoints = append(mountpoints, mp)
+	}
+
+	return mountpoints
+}
+
 func statusFromNative(x containerd.Status, labels map[string]string) string {
 	switch s := x.Status; s {
 	case containerd.Stopped:
@@ -338,12 +401,15 @@ func statusFromNative(x containerd.Status, labels map[string]string) string {
 }
 
 func networkSettingsFromNative(n *native.NetNS, sp *specs.Spec) (*NetworkSettings, error) {
-	if n == nil {
-		return nil, nil
-	}
 	res := &NetworkSettings{
 		Networks: make(map[string]*NetworkEndpointSettings),
 	}
+	resPortMap := make(nat.PortMap)
+	res.Ports = &resPortMap
+	if n == nil {
+		return res, nil
+	}
+
 	var primary *NetworkEndpointSettings
 	for _, x := range n.Interfaces {
 		if x.Interface.Flags&net.FlagLoopback != 0 {
@@ -358,7 +424,7 @@ func networkSettingsFromNative(n *native.NetNS, sp *specs.Spec) (*NetworkSetting
 		for _, a := range x.Addrs {
 			ip, ipnet, err := net.ParseCIDR(a)
 			if err != nil {
-				logrus.WithError(err).WithField("name", x.Name).Warnf("failed to parse %q", a)
+				log.L.WithError(err).WithField("name", x.Name).Warnf("failed to parse %q", a)
 				continue
 			}
 			if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
@@ -378,7 +444,7 @@ func networkSettingsFromNative(n *native.NetNS, sp *specs.Spec) (*NetworkSetting
 		res.Networks[fakeDockerNetworkName] = nes
 
 		if portsLabel, ok := sp.Annotations[labels.Ports]; ok {
-			var ports []gocni.PortMapping
+			var ports []cni.PortMapping
 			err := json.Unmarshal([]byte(portsLabel), &ports)
 			if err != nil {
 				return nil, err
@@ -387,8 +453,11 @@ func networkSettingsFromNative(n *native.NetNS, sp *specs.Spec) (*NetworkSetting
 			if err != nil {
 				return nil, err
 			}
-			res.Ports = nports
+			for portLabel, portBindings := range *nports {
+				resPortMap[portLabel] = portBindings
+			}
 		}
+
 		if x.Index == n.PrimaryInterface {
 			primary = nes
 		}
@@ -404,7 +473,7 @@ func networkSettingsFromNative(n *native.NetNS, sp *specs.Spec) (*NetworkSetting
 	return res, nil
 }
 
-func convertToNatPort(portMappings []gocni.PortMapping) (*nat.PortMap, error) {
+func convertToNatPort(portMappings []cni.PortMapping) (*nat.PortMap, error) {
 	portMap := make(nat.PortMap)
 	for _, portMapping := range portMappings {
 		ports := []nat.PortBinding{}
@@ -443,29 +512,29 @@ type Network struct {
 	// Scope, Driver, etc. are omitted
 }
 
+type structuredCNI struct {
+	Name    string `json:"name"`
+	Plugins []struct {
+		Ipam struct {
+			Ranges [][]IPAMConfig `json:"ranges"`
+		} `json:"ipam"`
+	} `json:"plugins"`
+}
+
 func NetworkFromNative(n *native.Network) (*Network, error) {
 	var res Network
 
-	nameResult := gjson.GetBytes(n.CNI, "name")
-	if s, ok := nameResult.Value().(string); ok {
-		res.Name = s
+	sCNI := &structuredCNI{}
+	err := json.Unmarshal(n.CNI, sCNI)
+	if err != nil {
+		return nil, err
 	}
 
-	// flatten twice to get ipamRangesResult=[{ "subnet": "10.4.19.0/24", "gateway": "10.4.19.1" }]
-	ipamRangesResult := gjson.GetBytes(n.CNI, "plugins.#.ipam.ranges|@flatten|@flatten")
-	for _, f := range ipamRangesResult.Array() {
-		m := f.Map()
-		var cfg IPAMConfig
-		if x, ok := m["subnet"]; ok {
-			cfg.Subnet = x.String()
+	res.Name = sCNI.Name
+	for _, plugin := range sCNI.Plugins {
+		for _, ranges := range plugin.Ipam.Ranges {
+			res.IPAM.Config = append(res.IPAM.Config, ranges...)
 		}
-		if x, ok := m["gateway"]; ok {
-			cfg.Gateway = x.String()
-		}
-		if x, ok := m["ipRange"]; ok {
-			cfg.IPRange = x.String()
-		}
-		res.IPAM.Config = append(res.IPAM.Config, cfg)
 	}
 
 	if n.NerdctlID != nil {
@@ -486,18 +555,12 @@ func parseMounts(nerdctlMounts string) ([]MountPoint, error) {
 		return nil, err
 	}
 
-	for i := range mounts {
-		rw, propagation := parseMountProperties(mounts[i].Mode)
-		mounts[i].RW = rw
-		mounts[i].Propagation = propagation
-	}
-
 	return mounts, nil
 }
 
-func parseMountProperties(option string) (rw bool, propagation string) {
+func ParseMountProperties(option []string) (rw bool, propagation string) {
 	rw = true
-	for _, opt := range strings.Split(option, ",") {
+	for _, opt := range option {
 		switch opt {
 		case "ro", "rro":
 			rw = false

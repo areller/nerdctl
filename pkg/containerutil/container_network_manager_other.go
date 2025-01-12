@@ -1,4 +1,4 @@
-//go:build darwin || freebsd || netbsd || openbsd
+//go:build !(linux || windows)
 
 /*
    Copyright The containerd Authors.
@@ -23,10 +23,14 @@ import (
 	"fmt"
 	"runtime"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/nerdctl/pkg/api/types"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/oci"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
 )
+
+type cniNetworkManagerPlatform struct {
+}
 
 // Verifies that the internal network settings are correct.
 func (m *cniNetworkManager) VerifyNetworkOptions(_ context.Context) error {

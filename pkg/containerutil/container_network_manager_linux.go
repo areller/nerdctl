@@ -22,21 +22,25 @@ import (
 	"io/fs"
 	"path/filepath"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/clientutil"
-	"github.com/containerd/nerdctl/pkg/dnsutil"
-	"github.com/containerd/nerdctl/pkg/dnsutil/hostsstore"
-	"github.com/containerd/nerdctl/pkg/netutil"
-	"github.com/containerd/nerdctl/pkg/resolvconf"
-	"github.com/containerd/nerdctl/pkg/rootlessutil"
-	"github.com/sirupsen/logrus"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/clientutil"
+	"github.com/containerd/nerdctl/v2/pkg/dnsutil"
+	"github.com/containerd/nerdctl/v2/pkg/dnsutil/hostsstore"
+	"github.com/containerd/nerdctl/v2/pkg/netutil"
+	"github.com/containerd/nerdctl/v2/pkg/resolvconf"
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
 )
+
+type cniNetworkManagerPlatform struct {
+}
 
 // Verifies that the internal network settings are correct.
 func (m *cniNetworkManager) VerifyNetworkOptions(_ context.Context) error {
-	e, err := netutil.NewCNIEnv(m.globalOptions.CNIPath, m.globalOptions.CNINetConfPath, netutil.WithDefaultNetwork())
+	e, err := netutil.NewCNIEnv(m.globalOptions.CNIPath, m.globalOptions.CNINetConfPath, netutil.WithNamespace(m.globalOptions.Namespace), netutil.WithDefaultNetwork(m.globalOptions.BridgeIP))
 	if err != nil {
 		return err
 	}
@@ -84,7 +88,7 @@ func (m *cniNetworkManager) ContainerNetworkingOpts(_ context.Context, container
 		return nil, nil, err
 	}
 
-	stateDir, err := ContainerStateDirPath(m.globalOptions, dataStore, containerID)
+	stateDir, err := ContainerStateDirPath(m.globalOptions.Namespace, dataStore, containerID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -95,10 +99,16 @@ func (m *cniNetworkManager) ContainerNetworkingOpts(_ context.Context, container
 	}
 
 	// the content of /etc/hosts is created in OCI Hook
-	etcHostsPath, err := hostsstore.AllocHostsFile(dataStore, m.globalOptions.Namespace, containerID)
+	hs, err := hostsstore.New(dataStore, m.globalOptions.Namespace)
 	if err != nil {
 		return nil, nil, err
 	}
+
+	etcHostsPath, err := hs.AllocHostsFile(containerID, []byte(""))
+	if err != nil {
+		return nil, nil, err
+	}
+
 	opts = append(opts, withCustomResolvConf(resolvConfPath), withCustomHosts(etcHostsPath))
 
 	if m.netOpts.UTSNamespace != UtsNamespaceHost {
@@ -149,7 +159,7 @@ func (m *cniNetworkManager) buildResolvConf(resolvConfPath string) error {
 			}
 			// if resolvConf file does't exist, using default resolvers
 			conf = &resolvconf.File{}
-			logrus.WithError(err).Debugf("resolvConf file doesn't exist on host")
+			log.L.WithError(err).Debugf("resolvConf file doesn't exist on host")
 		}
 		conf, err = resolvconf.FilterResolvDNS(conf.Content, true)
 		if err != nil {

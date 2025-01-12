@@ -20,19 +20,23 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/pkg/netns"
-	gocni "github.com/containerd/go-cni"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/netns"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/go-cni"
 
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/netutil"
-	"github.com/containerd/nerdctl/pkg/ocihook"
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/netutil"
+	"github.com/containerd/nerdctl/v2/pkg/ocihook"
 )
+
+type cniNetworkManagerPlatform struct {
+	netNs *netns.NetNS
+}
 
 // Verifies that the internal network settings are correct.
 func (m *cniNetworkManager) VerifyNetworkOptions(_ context.Context) error {
-	e, err := netutil.NewCNIEnv(m.globalOptions.CNIPath, m.globalOptions.CNINetConfPath, netutil.WithDefaultNetwork())
+	e, err := netutil.NewCNIEnv(m.globalOptions.CNIPath, m.globalOptions.CNINetConfPath, netutil.WithNamespace(m.globalOptions.Namespace), netutil.WithDefaultNetwork(m.globalOptions.BridgeIP))
 	if err != nil {
 		return err
 	}
@@ -62,26 +66,26 @@ func (m *cniNetworkManager) VerifyNetworkOptions(_ context.Context) error {
 	return nil
 }
 
-func (m *cniNetworkManager) getCNI() (gocni.CNI, error) {
-	e, err := netutil.NewCNIEnv(m.globalOptions.CNIPath, m.globalOptions.CNINetConfPath, netutil.WithDefaultNetwork())
+func (m *cniNetworkManager) getCNI() (cni.CNI, error) {
+	e, err := netutil.NewCNIEnv(m.globalOptions.CNIPath, m.globalOptions.CNINetConfPath, netutil.WithNamespace(m.globalOptions.Namespace), netutil.WithDefaultNetwork(m.globalOptions.BridgeIP))
 	if err != nil {
 		return nil, fmt.Errorf("failed to instantiate CNI env: %s", err)
 	}
 
-	cniOpts := []gocni.Opt{
-		gocni.WithPluginDir([]string{m.globalOptions.CNIPath}),
-		gocni.WithPluginConfDir(m.globalOptions.CNINetConfPath),
+	cniOpts := []cni.Opt{
+		cni.WithPluginDir([]string{m.globalOptions.CNIPath}),
+		cni.WithPluginConfDir(m.globalOptions.CNINetConfPath),
 	}
 
 	if netMap, err := verifyNetworkTypes(e, m.netOpts.NetworkSlice, nil); err == nil {
 		for _, netConf := range netMap {
-			cniOpts = append(cniOpts, gocni.WithConfListBytes(netConf.Bytes))
+			cniOpts = append(cniOpts, cni.WithConfListBytes(netConf.Bytes))
 		}
 	} else {
 		return nil, err
 	}
 
-	return gocni.New(cniOpts...)
+	return cni.New(cniOpts...)
 }
 
 // Performs setup actions required for the container with the given ID.
@@ -114,12 +118,12 @@ func (m *cniNetworkManager) CleanupNetworking(ctx context.Context, container con
 		return fmt.Errorf("failed to get container specs for networking cleanup: %s", err)
 	}
 
-	netNsId, found := spec.Annotations[ocihook.NetworkNamespace]
+	netNsID, found := spec.Annotations[ocihook.NetworkNamespace]
 	if !found {
 		return fmt.Errorf("no %q annotation present on container with ID %s", ocihook.NetworkNamespace, containerID)
 	}
 
-	return cni.Remove(ctx, containerID, netNsId, m.getCNINamespaceOpts()...)
+	return cni.Remove(ctx, containerID, netNsID, m.getCNINamespaceOpts()...)
 }
 
 // Returns the set of NetworkingOptions which should be set as labels on the container.
@@ -167,10 +171,10 @@ func (m *cniNetworkManager) setupNetNs() (*netns.NetNS, error) {
 	return ns, err
 }
 
-// Returns the []gocni.NamespaceOpts to be used for CNI setup/teardown.
-func (m *cniNetworkManager) getCNINamespaceOpts() []gocni.NamespaceOpts {
-	opts := []gocni.NamespaceOpts{
-		gocni.WithLabels(map[string]string{
+// Returns the []cni.NamespaceOpts to be used for CNI setup/teardown.
+func (m *cniNetworkManager) getCNINamespaceOpts() []cni.NamespaceOpts {
+	opts := []cni.NamespaceOpts{
+		cni.WithLabels(map[string]string{
 			// allow loose CNI argument verification
 			// FYI: https://github.com/containernetworking/cni/issues/560
 			"IgnoreUnknown": "1",
@@ -178,15 +182,15 @@ func (m *cniNetworkManager) getCNINamespaceOpts() []gocni.NamespaceOpts {
 	}
 
 	if m.netOpts.MACAddress != "" {
-		opts = append(opts, gocni.WithArgs("MAC", m.netOpts.MACAddress))
+		opts = append(opts, cni.WithArgs("MAC", m.netOpts.MACAddress))
 	}
 
 	if m.netOpts.IPAddress != "" {
-		opts = append(opts, gocni.WithArgs("IP", m.netOpts.IPAddress))
+		opts = append(opts, cni.WithArgs("IP", m.netOpts.IPAddress))
 	}
 
 	if m.netOpts.PortMappings != nil {
-		opts = append(opts, gocni.WithCapabilityPortMap(m.netOpts.PortMappings))
+		opts = append(opts, cni.WithCapabilityPortMap(m.netOpts.PortMappings))
 	}
 
 	return opts

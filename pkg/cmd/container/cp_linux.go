@@ -18,18 +18,44 @@ package container
 
 import (
 	"context"
+	"fmt"
 
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/containerutil"
+	containerd "github.com/containerd/containerd/v2/client"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/idutil/containerwalker"
 )
 
 // Cp copies files/folders between a running container and the local filesystem.
-func Cp(ctx context.Context, options types.ContainerCpOptions) error {
-	return containerutil.CopyFiles(
-		ctx,
-		options.Container2Host,
-		options.Pid,
-		options.DestPath,
-		options.SrcPath,
-		options.FollowSymLink)
+func Cp(ctx context.Context, client *containerd.Client, options types.ContainerCpOptions) error {
+	walker := &containerwalker.ContainerWalker{
+		Client: client,
+		OnFound: func(ctx context.Context, found containerwalker.Found) error {
+			if found.MatchCount > 1 {
+				return fmt.Errorf("multiple IDs found with provided prefix: %s", found.Req)
+			}
+			return containerutil.CopyFiles(
+				ctx,
+				client,
+				found.Container,
+				options)
+		},
+	}
+	count, err := walker.Walk(ctx, options.ContainerReq)
+
+	if count == -1 {
+		if err == nil {
+			panic("nil error and count == -1 from ContainerWalker.Walk should never happen")
+		}
+		err = fmt.Errorf("unable to copy: %w", err)
+	} else if count == 0 {
+		if err != nil {
+			err = fmt.Errorf("unable to retrieve containers with error: %w", err)
+		} else {
+			err = fmt.Errorf("no container found for: %s", options.ContainerReq)
+		}
+	}
+
+	return err
 }

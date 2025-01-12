@@ -20,13 +20,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"testing"
 
-	"github.com/compose-spec/compose-go/types"
-	"github.com/containerd/nerdctl/pkg/composer/projectloader"
-	"github.com/containerd/nerdctl/pkg/strutil"
-	"github.com/containerd/nerdctl/pkg/testutil"
+	"github.com/compose-spec/compose-go/v2/types"
 	"gotest.tools/v3/assert"
+
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
+	"github.com/containerd/nerdctl/v2/pkg/testutil"
 )
 
 func TestServicePortConfigToFlagP(t *testing.T) {
@@ -78,6 +80,11 @@ var in = strutil.InStringSlice
 
 func TestParse(t *testing.T) {
 	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("test is not compatible with windows")
+	}
+
 	const dockerComposeYAML = `
 version: '3.1'
 
@@ -104,6 +111,7 @@ services:
     volumes:
       - wordpress:/var/www/html
     pids_limit: 100
+    shm_size: 1G
     dns:
       - 8.8.8.8
       - 8.8.4.4
@@ -115,6 +123,9 @@ services:
       options:
         max-size: "5K"
         max-file: "2"
+    user: 1001:1001
+    group_add:
+      - "1001"
 
   db:
     image: mariadb:10.5
@@ -136,7 +147,7 @@ volumes:
 	comp := testutil.NewComposeDir(t, dockerComposeYAML)
 	defer comp.CleanUp()
 
-	project, err := projectloader.Load(comp.YAMLFullPath(), comp.ProjectName(), nil)
+	project, err := testutil.LoadProject(comp.YAMLFullPath(), comp.ProjectName(), nil)
 	assert.NilError(t, err)
 
 	wpSvc, err := project.GetService("wordpress")
@@ -150,7 +161,7 @@ volumes:
 	assert.Assert(t, wp.Image == "wordpress:5.7")
 	assert.Assert(t, len(wp.Containers) == 1)
 	wp1 := wp.Containers[0]
-	assert.Assert(t, wp1.Name == fmt.Sprintf("%s_wordpress_1", project.Name))
+	assert.Assert(t, wp1.Name == DefaultContainerName(project.Name, "wordpress", "1"))
 	assert.Assert(t, in(wp1.RunArgs, "--name="+wp1.Name))
 	assert.Assert(t, in(wp1.RunArgs, "--hostname=wordpress"))
 	assert.Assert(t, in(wp1.RunArgs, fmt.Sprintf("--net=%s_default", project.Name)))
@@ -171,6 +182,9 @@ volumes:
 	assert.Assert(t, in(wp1.RunArgs, "--log-opt=max-file=2"))
 	assert.Assert(t, in(wp1.RunArgs, "--add-host=test.com:172.19.1.1"))
 	assert.Assert(t, in(wp1.RunArgs, "--add-host=test2.com:172.19.1.2"))
+	assert.Assert(t, in(wp1.RunArgs, "--shm-size=1073741824"))
+	assert.Assert(t, in(wp1.RunArgs, "--user=1001:1001"))
+	assert.Assert(t, in(wp1.RunArgs, "--group-add=1001"))
 
 	dbSvc, err := project.GetService("db")
 	assert.NilError(t, err)
@@ -181,7 +195,7 @@ volumes:
 	t.Logf("db: %+v", db)
 	assert.Assert(t, len(db.Containers) == 1)
 	db1 := db.Containers[0]
-	assert.Assert(t, db1.Name == fmt.Sprintf("%s_db_1", project.Name))
+	assert.Assert(t, db1.Name == DefaultContainerName(project.Name, "db", "1"))
 	assert.Assert(t, in(db1.RunArgs, "--hostname=db"))
 	assert.Assert(t, in(db1.RunArgs, fmt.Sprintf("-v=%s_db:/var/lib/mysql", project.Name)))
 	assert.Assert(t, in(db1.RunArgs, "--stop-signal=SIGUSR1"))
@@ -194,7 +208,7 @@ func TestParseDeprecated(t *testing.T) {
 services:
   foo:
     image: nginx:alpine
-    # scale is deprecated in favor of deploy.replicas, but still valid
+    # scale was deprecated in favor of deploy.replicas, and is now ignored
     scale: 2
     # cpus is deprecated in favor of deploy.resources.limits.cpu, but still valid
     cpus: 0.42
@@ -204,7 +218,7 @@ services:
 	comp := testutil.NewComposeDir(t, dockerComposeYAML)
 	defer comp.CleanUp()
 
-	project, err := projectloader.Load(comp.YAMLFullPath(), comp.ProjectName(), nil)
+	project, err := testutil.LoadProject(comp.YAMLFullPath(), comp.ProjectName(), nil)
 	assert.NilError(t, err)
 
 	fooSvc, err := project.GetService("foo")
@@ -214,9 +228,9 @@ services:
 	assert.NilError(t, err)
 
 	t.Logf("foo: %+v", foo)
-	assert.Assert(t, len(foo.Containers) == 2)
+	assert.Assert(t, len(foo.Containers) == 1)
 	for i, c := range foo.Containers {
-		assert.Assert(t, c.Name == fmt.Sprintf("%s_foo_%d", project.Name, i+1))
+		assert.Assert(t, c.Name == DefaultContainerName(project.Name, "foo", strconv.Itoa(i+1)))
 		assert.Assert(t, in(c.RunArgs, "--name="+c.Name))
 		assert.Assert(t, in(c.RunArgs, fmt.Sprintf("--cpus=%f", 0.42)))
 		assert.Assert(t, in(c.RunArgs, "-m=44040192"))
@@ -257,11 +271,15 @@ services:
           devices:
           - capabilities: ["utility"]
             count: all
+  qux: # replicas=0
+    image: nginx:alpine
+    deploy:
+      replicas: 0
 `
 	comp := testutil.NewComposeDir(t, dockerComposeYAML)
 	defer comp.CleanUp()
 
-	project, err := projectloader.Load(comp.YAMLFullPath(), comp.ProjectName(), nil)
+	project, err := testutil.LoadProject(comp.YAMLFullPath(), comp.ProjectName(), nil)
 	assert.NilError(t, err)
 
 	fooSvc, err := project.GetService("foo")
@@ -273,7 +291,7 @@ services:
 	t.Logf("foo: %+v", foo)
 	assert.Assert(t, len(foo.Containers) == 3)
 	for i, c := range foo.Containers {
-		assert.Assert(t, c.Name == fmt.Sprintf("%s_foo_%d", project.Name, i+1))
+		assert.Assert(t, c.Name == DefaultContainerName(project.Name, "foo", strconv.Itoa(i+1)))
 		assert.Assert(t, in(c.RunArgs, "--name="+c.Name))
 
 		assert.Assert(t, in(c.RunArgs, "--restart=no"))
@@ -307,10 +325,54 @@ services:
 		assert.Assert(t, in(c.RunArgs, "--restart=no"))
 		assert.Assert(t, in(c.RunArgs, `--gpus=capabilities=utility,count=-1`))
 	}
+
+	quxSvc, err := project.GetService("qux")
+	assert.NilError(t, err)
+
+	qux, err := Parse(project, quxSvc)
+	assert.NilError(t, err)
+
+	t.Logf("qux: %+v", qux)
+	assert.Assert(t, len(qux.Containers) == 0)
+
+}
+
+func TestParseDevices(t *testing.T) {
+	const dockerComposeYAML = `
+services:
+  foo:
+    image: nginx:alpine
+    devices:
+      - /dev/a
+      - /dev/b:/dev/b
+      - /dev/c:/dev/c:rw
+`
+	comp := testutil.NewComposeDir(t, dockerComposeYAML)
+	defer comp.CleanUp()
+
+	project, err := testutil.LoadProject(comp.YAMLFullPath(), comp.ProjectName(), nil)
+	assert.NilError(t, err)
+
+	fooSvc, err := project.GetService("foo")
+	assert.NilError(t, err)
+
+	foo, err := Parse(project, fooSvc)
+	assert.NilError(t, err)
+
+	t.Logf("foo: %+v", foo)
+	for _, c := range foo.Containers {
+		assert.Assert(t, in(c.RunArgs, "--device=/dev/a:/dev/a:rwm"))
+		assert.Assert(t, in(c.RunArgs, "--device=/dev/b:/dev/b:rwm"))
+		assert.Assert(t, in(c.RunArgs, "--device=/dev/c:/dev/c:rw"))
+	}
 }
 
 func TestParseRelative(t *testing.T) {
 	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("test is not compatible with windows")
+	}
 	const dockerComposeYAML = `
 services:
   foo:
@@ -324,7 +386,7 @@ services:
 	comp := testutil.NewComposeDir(t, dockerComposeYAML)
 	defer comp.CleanUp()
 
-	project, err := projectloader.Load(comp.YAMLFullPath(), comp.ProjectName(), nil)
+	project, err := testutil.LoadProject(comp.YAMLFullPath(), comp.ProjectName(), nil)
 	assert.NilError(t, err)
 
 	fooSvc, err := project.GetService("foo")
@@ -356,7 +418,7 @@ services:
 	comp := testutil.NewComposeDir(t, dockerComposeYAML)
 	defer comp.CleanUp()
 
-	project, err := projectloader.Load(comp.YAMLFullPath(), comp.ProjectName(), nil)
+	project, err := testutil.LoadProject(comp.YAMLFullPath(), comp.ProjectName(), nil)
 	assert.NilError(t, err)
 
 	fooSvc, err := project.GetService("foo")
@@ -386,6 +448,9 @@ services:
 
 func TestParseConfigs(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("test is not compatible with windows")
+	}
 	const dockerComposeYAML = `
 services:
   foo:
@@ -416,7 +481,7 @@ configs:
 	comp := testutil.NewComposeDir(t, dockerComposeYAML)
 	defer comp.CleanUp()
 
-	project, err := projectloader.Load(comp.YAMLFullPath(), comp.ProjectName(), nil)
+	project, err := testutil.LoadProject(comp.YAMLFullPath(), comp.ProjectName(), nil)
 	assert.NilError(t, err)
 
 	for _, f := range []string{"secret1", "secret2", "secret3", "config1", "config2"} {
@@ -460,7 +525,7 @@ services:
 	comp := testutil.NewComposeDir(t, dockerComposeYAML)
 	defer comp.CleanUp()
 
-	project, err := projectloader.Load(comp.YAMLFullPath(), comp.ProjectName(), nil)
+	project, err := testutil.LoadProject(comp.YAMLFullPath(), comp.ProjectName(), nil)
 	assert.NilError(t, err)
 
 	getContainersFromService := func(svcName string) []Container {

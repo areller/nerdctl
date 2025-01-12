@@ -17,36 +17,35 @@
 package container
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
-	"text/tabwriter"
-	"text/template"
+	"sync"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/pkg/progress"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/formatter"
-	"github.com/containerd/nerdctl/pkg/imgutil"
-	"github.com/containerd/nerdctl/pkg/labels"
-	"github.com/containerd/nerdctl/pkg/labels/k8slabels"
-	"github.com/sirupsen/logrus"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/pkg/progress"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/containerdutil"
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/formatter"
+	"github.com/containerd/nerdctl/v2/pkg/imgutil"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
 )
 
 // List prints containers according to `options`.
-func List(ctx context.Context, client *containerd.Client, options types.ContainerListOptions) error {
-	containers, err := filterContainers(ctx, client, options.Filters, options.LastN, options.All)
+func List(ctx context.Context, client *containerd.Client, options types.ContainerListOptions) ([]ListItem, error) {
+	containers, cMap, err := filterContainers(ctx, client, options.Filters, options.LastN, options.All)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return printContainers(ctx, client, containers, options)
+	return prepareContainers(ctx, client, containers, cMap, options)
 }
 
 // filterContainers returns containers matching the filters.
@@ -55,44 +54,66 @@ func List(ctx context.Context, client *containerd.Client, options types.Containe
 //   - all means showing all containers (default shows just running).
 //   - lastN means only showing n last created containers (includes all states). Non-positive values are ignored.
 //     In other words, if lastN is positive, all will be set to true.
-func filterContainers(ctx context.Context, client *containerd.Client, filters []string, lastN int, all bool) ([]containerd.Container, error) {
+func filterContainers(ctx context.Context, client *containerd.Client, filters []string, lastN int, all bool) ([]containerd.Container, map[string]string, error) {
 	containers, err := client.Containers(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	filterCtx, err := foldContainerFilters(ctx, containers, filters)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	containers = filterCtx.MatchesFilters(ctx)
+
+	sort.Slice(containers, func(i, j int) bool {
+		infoI, _ := containers[i].Info(ctx, containerd.WithoutRefreshedMetadata)
+		infoJ, _ := containers[j].Info(ctx, containerd.WithoutRefreshedMetadata)
+		return infoI.CreatedAt.After(infoJ.CreatedAt)
+	})
+
 	if lastN > 0 {
 		all = true
-		sort.Slice(containers, func(i, j int) bool {
-			infoI, _ := containers[i].Info(ctx, containerd.WithoutRefreshedMetadata)
-			infoJ, _ := containers[j].Info(ctx, containerd.WithoutRefreshedMetadata)
-			return infoI.CreatedAt.After(infoJ.CreatedAt)
-		})
 		if lastN < len(containers) {
 			containers = containers[:lastN]
 		}
 	}
 
-	if all {
-		return containers, nil
+	var wg sync.WaitGroup
+	statusPerContainer := make(map[string]string)
+	var mu sync.Mutex
+	// formatter.ContainerStatus(ctx, c) is time consuming so we do it in goroutines and return the container's id with status as a map.
+	// prepareContainers func will use this map to avoid call formatter.ContainerStatus again.
+	for _, c := range containers {
+		if c.ID() == "" {
+			return nil, nil, fmt.Errorf("container id is nill")
+		}
+		wg.Add(1)
+		go func(ctx context.Context, c containerd.Container) {
+			defer wg.Done()
+			cStatus := formatter.ContainerStatus(ctx, c)
+			mu.Lock()
+			statusPerContainer[c.ID()] = cStatus
+			mu.Unlock()
+		}(ctx, c)
 	}
+	wg.Wait()
+	if all || filterCtx.all {
+		return containers, statusPerContainer, nil
+	}
+
 	var upContainers []containerd.Container
 	for _, c := range containers {
-		cStatus := formatter.ContainerStatus(ctx, c)
+		cStatus := statusPerContainer[c.ID()]
 		if strings.HasPrefix(cStatus, "Up") {
 			upContainers = append(upContainers, c)
 		}
 	}
-	return upContainers, nil
+	return upContainers, statusPerContainer, nil
 }
 
-type containerPrintable struct {
+type ListItem struct {
 	Command   string
-	CreatedAt string
+	CreatedAt time.Time
 	ID        string
 	Image     string
 	Platform  string // nerdctl extension
@@ -102,227 +123,97 @@ type containerPrintable struct {
 	Runtime   string // nerdctl extension
 	Size      string
 	Labels    string
+	LabelsMap map[string]string `json:"-"`
+
 	// TODO: "LocalVolumes", "Mounts", "Networks", "RunningFor", "State"
 }
 
-func printContainers(ctx context.Context, client *containerd.Client, containers []containerd.Container, options types.ContainerListOptions) error {
-	w := options.Stdout
-	var (
-		wide bool
-		tmpl *template.Template
-	)
-	switch options.Format {
-	case "", "table":
-		w = tabwriter.NewWriter(w, 4, 8, 4, ' ', 0)
-		if !options.Quiet {
-			printHeader := "CONTAINER ID\tIMAGE\tCOMMAND\tCREATED\tSTATUS\tPORTS\tNAMES"
-			if options.Size {
-				printHeader += "\tSIZE"
-			}
-			fmt.Fprintln(w, printHeader)
-		}
-	case "raw":
-		return errors.New("unsupported format: \"raw\"")
-	case "wide":
-		w = tabwriter.NewWriter(w, 4, 8, 4, ' ', 0)
-		if !options.Quiet {
-			fmt.Fprintln(w, "CONTAINER ID\tIMAGE\tCOMMAND\tCREATED\tSTATUS\tPORTS\tNAMES\tRUNTIME\tPLATFORM\tSIZE")
-			wide = true
-		}
-	default:
-		if options.Quiet {
-			return errors.New("format and quiet must not be specified together")
-		}
-		var err error
-		tmpl, err = formatter.ParseTemplate(options.Format)
-		if err != nil {
-			return err
-		}
-	}
+func (x *ListItem) Label(s string) string {
+	return x.LabelsMap[s]
+}
 
-	for _, c := range containers {
+func prepareContainers(ctx context.Context, client *containerd.Client, containers []containerd.Container, statusPerContainer map[string]string, options types.ContainerListOptions) ([]ListItem, error) {
+	listItems := make([]ListItem, len(containers))
+	snapshottersCache := map[string]snapshots.Snapshotter{}
+	for i, c := range containers {
 		info, err := c.Info(ctx, containerd.WithoutRefreshedMetadata)
 		if err != nil {
 			if errdefs.IsNotFound(err) {
-				logrus.Warn(err)
+				log.G(ctx).Warn(err)
 				continue
 			}
-			return err
+			return nil, err
 		}
-
 		spec, err := c.Spec(ctx)
 		if err != nil {
 			if errdefs.IsNotFound(err) {
-				logrus.Warn(err)
+				log.G(ctx).Warn(err)
 				continue
 			}
-			return err
+			return nil, err
 		}
-
-		imageName := info.Image
 		id := c.ID()
 		if options.Truncate && len(id) > 12 {
 			id = id[:12]
 		}
-
-		p := containerPrintable{
+		var status string
+		if s, ok := statusPerContainer[c.ID()]; ok {
+			status = s
+		} else {
+			return nil, fmt.Errorf("can't get container %s status", c.ID())
+		}
+		li := ListItem{
 			Command:   formatter.InspectContainerCommand(spec, options.Truncate, true),
-			CreatedAt: info.CreatedAt.Round(time.Second).Local().String(), // format like "2021-08-07 02:19:45 +0900 JST"
+			CreatedAt: info.CreatedAt,
 			ID:        id,
-			Image:     imageName,
+			Image:     info.Image,
 			Platform:  info.Labels[labels.Platform],
-			Names:     getPrintableContainerName(info.Labels),
+			Names:     containerutil.GetContainerName(info.Labels),
 			Ports:     formatter.FormatPorts(info.Labels),
-			Status:    formatter.ContainerStatus(ctx, c),
+			Status:    status,
 			Runtime:   info.Runtime.Name,
 			Labels:    formatter.FormatLabels(info.Labels),
+			LabelsMap: info.Labels,
 		}
-
-		if options.Size || wide {
-			containerSize, err := getContainerSize(ctx, client, c, info)
+		if options.Size {
+			snapshotter, ok := snapshottersCache[info.Snapshotter]
+			if !ok {
+				snapshottersCache[info.Snapshotter] = containerdutil.SnapshotService(client, info.Snapshotter)
+				snapshotter = snapshottersCache[info.Snapshotter]
+			}
+			containerSize, err := getContainerSize(ctx, snapshotter, info.SnapshotKey)
 			if err != nil {
-				return err
+				return nil, err
 			}
-			p.Size = containerSize
+			li.Size = containerSize
 		}
-
-		if tmpl != nil {
-			var b bytes.Buffer
-			if err := tmpl.Execute(&b, p); err != nil {
-				return err
-			}
-			if _, err = fmt.Fprintf(w, b.String()+"\n"); err != nil {
-				return err
-			}
-		} else if options.Quiet {
-			if _, err := fmt.Fprintf(w, "%s\n", id); err != nil {
-				return err
-			}
-		} else {
-			format := "%s\t%s\t%s\t%s\t%s\t%s\t%s"
-			args := []interface{}{
-				p.ID,
-				p.Image,
-				p.Command,
-				formatter.TimeSinceInHuman(info.CreatedAt),
-				p.Status,
-				p.Ports,
-				p.Names,
-			}
-			if wide {
-				format += "\t%s\t%s\t%s\n"
-				args = append(args, p.Runtime, p.Platform, p.Size)
-			} else if options.Size {
-				format += "\t%s\n"
-				args = append(args, p.Size)
-			} else {
-				format += "\n"
-			}
-			if _, err := fmt.Fprintf(w, format, args...); err != nil {
-				return err
-			}
-		}
-
+		listItems[i] = li
 	}
-	if f, ok := w.(formatter.Flusher); ok {
-		return f.Flush()
-	}
-	return nil
-}
-
-func getPrintableContainerName(containerLabels map[string]string) string {
-	if name, ok := containerLabels[labels.Name]; ok {
-		return name
-	}
-
-	if ns, ok := containerLabels[k8slabels.PodNamespace]; ok {
-		if podName, ok := containerLabels[k8slabels.PodName]; ok {
-			if containerName, ok := containerLabels[k8slabels.ContainerName]; ok {
-				// Container
-				return fmt.Sprintf("k8s://%s/%s/%s", ns, podName, containerName)
-			}
-			// Pod sandbox
-			return fmt.Sprintf("k8s://%s/%s", ns, podName)
-		}
-	}
-	return ""
-}
-
-type containerVolume struct {
-	Type        string
-	Name        string
-	Source      string
-	Destination string
-	Mode        string
-	RW          bool
-	Propagation string
-}
-
-func getContainerVolumes(containerLabels map[string]string) []*containerVolume {
-	var vols []*containerVolume
-	volLabels := []string{labels.AnonymousVolumes, labels.Mounts}
-	for _, volLabel := range volLabels {
-		names, ok := containerLabels[volLabel]
-		if !ok {
-			continue
-		}
-		var (
-			volumes []*containerVolume
-			err     error
-		)
-		if volLabel == labels.Mounts {
-			err = json.Unmarshal([]byte(names), &volumes)
-		}
-		if volLabel == labels.AnonymousVolumes {
-			var anonymous []string
-			err = json.Unmarshal([]byte(names), &anonymous)
-			for _, anony := range anonymous {
-				volumes = append(volumes, &containerVolume{Name: anony})
-			}
-
-		}
-		if err != nil {
-			logrus.Warn(err)
-		}
-		vols = append(vols, volumes...)
-	}
-	return vols
+	return listItems, nil
 }
 
 func getContainerNetworks(containerLables map[string]string) []string {
 	var networks []string
 	if names, ok := containerLables[labels.Networks]; ok {
 		if err := json.Unmarshal([]byte(names), &networks); err != nil {
-			logrus.Warn(err)
+			log.L.Warn(err)
 		}
 	}
 	return networks
 }
 
-func getContainerSize(ctx context.Context, client *containerd.Client, c containerd.Container, info containers.Container) (string, error) {
+func getContainerSize(ctx context.Context, snapshotter snapshots.Snapshotter, snapshotKey string) (string, error) {
 	// get container snapshot size
-	snapshotKey := info.SnapshotKey
 	var containerSize int64
+	var imageSize int64
 
 	if snapshotKey != "" {
-		usage, err := client.SnapshotService(info.Snapshotter).Usage(ctx, snapshotKey)
+		rw, all, err := imgutil.ResourceUsage(ctx, snapshotter, snapshotKey)
 		if err != nil {
 			return "", err
 		}
-		containerSize = usage.Size
-	}
-
-	// get the image interface
-	image, err := c.Image(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	sn := client.SnapshotService(info.Snapshotter)
-
-	imageSize, err := imgutil.UnpackedImageSize(ctx, sn, image)
-	if err != nil {
-		return "", err
+		containerSize = rw.Size
+		imageSize = all.Size
 	}
 
 	return fmt.Sprintf("%s (virtual %s)", progress.Bytes(containerSize).String(), progress.Bytes(imageSize).String()), nil

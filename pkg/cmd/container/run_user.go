@@ -21,11 +21,11 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/oci"
 )
 
-func GenerateUserOpts(user string) ([]oci.SpecOpts, error) {
+func generateUserOpts(user string) ([]oci.SpecOpts, error) {
 	var opts []oci.SpecOpts
 	if user != "" {
 		opts = append(opts, oci.WithUser(user), withResetAdditionalGIDs(), oci.WithAdditionalGIDs(user))
@@ -33,7 +33,7 @@ func GenerateUserOpts(user string) ([]oci.SpecOpts, error) {
 	return opts, nil
 }
 
-func GenerateUmaskOpts(umask string) ([]oci.SpecOpts, error) {
+func generateUmaskOpts(umask string) ([]oci.SpecOpts, error) {
 	var opts []oci.SpecOpts
 
 	if umask != "" {
@@ -46,7 +46,7 @@ func GenerateUmaskOpts(umask string) ([]oci.SpecOpts, error) {
 	return opts, nil
 }
 
-func GenerateGroupsOpts(groups []string) ([]oci.SpecOpts, error) {
+func generateGroupsOpts(groups []string) ([]oci.SpecOpts, error) {
 	var opts []oci.SpecOpts
 
 	if len(groups) != 0 {

@@ -19,11 +19,12 @@ package namespace
 import (
 	"context"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/formatter"
-	"github.com/containerd/nerdctl/pkg/inspecttypes/native"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/formatter"
+	"github.com/containerd/nerdctl/v2/pkg/inspecttypes/native"
 )
 
 func Inspect(ctx context.Context, client *containerd.Client, inspectedNamespaces []string, options types.NamespaceInspectOptions) error {

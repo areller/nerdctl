@@ -20,12 +20,13 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/images/archive"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/idutil/imagewalker"
-	"github.com/containerd/nerdctl/pkg/platformutil"
-	"github.com/containerd/nerdctl/pkg/strutil"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images/archive"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/idutil/imagewalker"
+	"github.com/containerd/nerdctl/v2/pkg/platformutil"
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
 )
 
 // Save exports `images` to a `io.Writer` (e.g., a file writer, or os.Stdout) specified by `options.Stdout`.
@@ -47,6 +48,13 @@ func Save(ctx context.Context, client *containerd.Client, images []string, optio
 			if found.UniqueImages > 1 {
 				return fmt.Errorf("ambiguous digest ID: multiple IDs found with provided prefix %s", found.Req)
 			}
+
+			// Ensure all the layers are here: https://github.com/containerd/nerdctl/issues/3425
+			err = EnsureAllContent(ctx, client, found.Image.Name, options.GOptions)
+			if err != nil {
+				return err
+			}
+
 			imgName := found.Image.Name
 			imgDigest := found.Image.Target.Digest.String()
 			if _, ok := savedImages[imgDigest]; !ok {

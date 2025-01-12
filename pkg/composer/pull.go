@@ -21,10 +21,11 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/compose-spec/compose-go/types"
-	"github.com/containerd/nerdctl/pkg/composer/serviceparser"
+	"github.com/compose-spec/compose-go/v2/types"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/composer/serviceparser"
 )
 
 type PullOptions struct {
@@ -32,8 +33,8 @@ type PullOptions struct {
 }
 
 func (c *Composer) Pull(ctx context.Context, po PullOptions, services []string) error {
-	return c.project.WithServices(services, func(svc types.ServiceConfig) error {
-		ps, err := serviceparser.Parse(c.project, svc)
+	return c.project.ForEachService(services, func(name string, svc *types.ServiceConfig) error {
+		ps, err := serviceparser.Parse(c.project, *svc)
 		if err != nil {
 			return err
 		}
@@ -42,7 +43,7 @@ func (c *Composer) Pull(ctx context.Context, po PullOptions, services []string) 
 }
 
 func (c *Composer) pullServiceImage(ctx context.Context, image string, platform string, ps *serviceparser.Service, po PullOptions) error {
-	logrus.Infof("Pulling image %s", image)
+	log.G(ctx).Infof("Pulling image %s", image)
 
 	var args []string // nolint: prealloc
 	if platform != "" {
@@ -57,6 +58,19 @@ func (c *Composer) pullServiceImage(ctx context.Context, image string, platform 
 	if publicKey, ok := ps.Unparsed.Extensions[serviceparser.ComposeCosignPublicKey]; ok {
 		args = append(args, "--cosign-key="+publicKey.(string))
 	}
+	if certificateIdentity, ok := ps.Unparsed.Extensions[serviceparser.ComposeCosignCertificateIdentity]; ok {
+		args = append(args, "--cosign-certificate-identity="+certificateIdentity.(string))
+	}
+	if certificateIdentityRegexp, ok := ps.Unparsed.Extensions[serviceparser.ComposeCosignCertificateIdentityRegexp]; ok {
+		args = append(args, "--cosign-certificate-identity-regexp="+certificateIdentityRegexp.(string))
+	}
+	if certificateOidcIssuer, ok := ps.Unparsed.Extensions[serviceparser.ComposeCosignCertificateOidcIssuer]; ok {
+		args = append(args, "--cosign-certificate-oidc-issuer="+certificateOidcIssuer.(string))
+	}
+	if certificateOidcIssuerRegexp, ok := ps.Unparsed.Extensions[serviceparser.ComposeCosignCertificateOidcIssuerRegexp]; ok {
+		args = append(args, "--cosign-certificate-oidc-issuer-regexp="+certificateOidcIssuerRegexp.(string))
+	}
+
 	if c.Options.Experimental {
 		args = append(args, "--experimental")
 	}
@@ -65,7 +79,7 @@ func (c *Composer) pullServiceImage(ctx context.Context, image string, platform 
 
 	cmd := c.createNerdctlCmd(ctx, append([]string{"pull"}, args...)...)
 	if c.DebugPrintFull {
-		logrus.Debugf("Running %v", cmd.Args)
+		log.G(ctx).Debugf("Running %v", cmd.Args)
 	}
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout

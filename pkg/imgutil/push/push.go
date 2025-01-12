@@ -25,22 +25,22 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/pkg/progress"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker"
-	"github.com/containerd/nerdctl/pkg/imgutil/dockerconfigresolver"
-	"github.com/containerd/nerdctl/pkg/imgutil/jobs"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-
 	"golang.org/x/sync/errgroup"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/pkg/progress"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
+
+	"github.com/containerd/nerdctl/v2/pkg/imgutil/jobs"
 )
 
 // Push pushes an image to a remote registry.
-func Push(ctx context.Context, client *containerd.Client, resolver remotes.Resolver, stdout io.Writer,
+func Push(ctx context.Context, client *containerd.Client, resolver remotes.Resolver, pushTracker docker.StatusTracker, stdout io.Writer,
 	localRef, remoteRef string, platform platforms.MatchComparer, allowNonDist, quiet bool) error {
 	img, err := client.ImageService().Get(ctx, localRef)
 	if err != nil {
@@ -48,7 +48,7 @@ func Push(ctx context.Context, client *containerd.Client, resolver remotes.Resol
 	}
 	desc := img.Target
 
-	ongoing := newPushJobs(dockerconfigresolver.PushTracker)
+	ongoing := newPushJobs(pushTracker)
 
 	eg, ctx := errgroup.WithContext(ctx)
 

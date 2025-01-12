@@ -19,27 +19,31 @@ package imgutil
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
+	"net/http"
 	"reflect"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/platforms"
-	refdocker "github.com/containerd/containerd/reference/docker"
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/snapshots"
-	"github.com/containerd/imgcrypt"
-	"github.com/containerd/imgcrypt/images/encryption"
-	"github.com/containerd/nerdctl/pkg/errutil"
-	"github.com/containerd/nerdctl/pkg/idutil/imagewalker"
-	"github.com/containerd/nerdctl/pkg/imgutil/dockerconfigresolver"
-	"github.com/containerd/nerdctl/pkg/imgutil/pull"
-	"github.com/docker/docker/errdefs"
 	"github.com/opencontainers/image-spec/identity"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/sirupsen/logrus"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/imgcrypt/v2"
+	"github.com/containerd/imgcrypt/v2/images/encryption"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/errutil"
+	"github.com/containerd/nerdctl/v2/pkg/idutil/imagewalker"
+	"github.com/containerd/nerdctl/v2/pkg/imgutil/dockerconfigresolver"
+	"github.com/containerd/nerdctl/v2/pkg/imgutil/pull"
+	"github.com/containerd/nerdctl/v2/pkg/referenceutil"
 )
 
 // EnsuredImage contains the image existed in containerd and its metadata.
@@ -57,7 +61,7 @@ type PullMode = string
 // GetExistingImage returns the specified image if exists in containerd. Return errdefs.NotFound() if not exists.
 func GetExistingImage(ctx context.Context, client *containerd.Client, snapshotter, rawRef string, platform ocispec.Platform) (*EnsuredImage, error) {
 	var res *EnsuredImage
-	imagewalker := &imagewalker.ImageWalker{
+	imgwalker := &imagewalker.ImageWalker{
 		Client: client,
 		OnFound: func(ctx context.Context, found imagewalker.Found) error {
 			if res != nil {
@@ -85,15 +89,15 @@ func GetExistingImage(ctx context.Context, client *containerd.Client, snapshotte
 			return nil
 		},
 	}
-	count, err := imagewalker.Walk(ctx, rawRef)
+	count, err := imgwalker.Walk(ctx, rawRef)
 	if err != nil {
 		return nil, err
 	}
 	if count == 0 {
-		return nil, errdefs.NotFound(fmt.Errorf("got count 0 after walking"))
+		return nil, errors.Join(errdefs.ErrNotFound, errors.New("got count 0 after walking"))
 	}
 	if res == nil {
-		return nil, errdefs.NotFound(fmt.Errorf("got nil res after walking"))
+		return nil, errors.Join(errdefs.ErrNotFound, errors.New("got nil res after walking"))
 	}
 	return res, nil
 }
@@ -101,64 +105,60 @@ func GetExistingImage(ctx context.Context, client *containerd.Client, snapshotte
 // EnsureImage ensures the image.
 //
 // # When insecure is set, skips verifying certs, and also falls back to HTTP when the registry does not speak HTTPS
-//
-// FIXME: this func has too many args
-func EnsureImage(ctx context.Context, client *containerd.Client, stdout, stderr io.Writer, snapshotter, rawRef string, mode PullMode, insecure bool, hostsDirs []string, ocispecPlatforms []ocispec.Platform, unpack *bool, quiet bool) (*EnsuredImage, error) {
-	switch mode {
+func EnsureImage(ctx context.Context, client *containerd.Client, rawRef string, options types.ImagePullOptions) (*EnsuredImage, error) {
+	switch options.Mode {
 	case "always", "missing", "never":
 		// NOP
 	default:
-		return nil, fmt.Errorf("unexpected pull mode: %q", mode)
+		return nil, fmt.Errorf("unexpected pull mode: %q", options.Mode)
 	}
 
 	// if not `always` pull and given one platform and image found locally, return existing image directly.
-	if mode != "always" && len(ocispecPlatforms) == 1 {
-		if res, err := GetExistingImage(ctx, client, snapshotter, rawRef, ocispecPlatforms[0]); err == nil {
+	if options.Mode != "always" && len(options.OCISpecPlatform) == 1 {
+		if res, err := GetExistingImage(ctx, client, options.GOptions.Snapshotter, rawRef, options.OCISpecPlatform[0]); err == nil {
 			return res, nil
 		} else if !errdefs.IsNotFound(err) {
 			return nil, err
 		}
 	}
 
-	if mode == "never" {
+	if options.Mode == "never" {
 		return nil, fmt.Errorf("image not available: %q", rawRef)
 	}
 
-	named, err := refdocker.ParseDockerRef(rawRef)
+	parsedReference, err := referenceutil.Parse(rawRef)
 	if err != nil {
 		return nil, err
 	}
-	ref := named.String()
-	refDomain := refdocker.Domain(named)
 
 	var dOpts []dockerconfigresolver.Opt
-	if insecure {
-		logrus.Warnf("skipping verifying HTTPS certs for %q", refDomain)
+	if options.GOptions.InsecureRegistry {
+		log.G(ctx).Warnf("skipping verifying HTTPS certs for %q", parsedReference.Domain)
 		dOpts = append(dOpts, dockerconfigresolver.WithSkipVerifyCerts(true))
 	}
-	dOpts = append(dOpts, dockerconfigresolver.WithHostsDirs(hostsDirs))
-	resolver, err := dockerconfigresolver.New(ctx, refDomain, dOpts...)
+	dOpts = append(dOpts, dockerconfigresolver.WithHostsDirs(options.GOptions.HostsDir))
+	resolver, err := dockerconfigresolver.New(ctx, parsedReference.Domain, dOpts...)
 	if err != nil {
 		return nil, err
 	}
 
-	img, err := PullImage(ctx, client, stdout, stderr, snapshotter, resolver, ref, ocispecPlatforms, unpack, quiet)
+	img, err := PullImage(ctx, client, resolver, parsedReference.String(), options)
 	if err != nil {
 		// In some circumstance (e.g. people just use 80 port to support pure http), the error will contain message like "dial tcp <port>: connection refused".
-		if !errutil.IsErrHTTPResponseToHTTPSClient(err) && !errutil.IsErrConnectionRefused(err) {
+		if !errors.Is(err, http.ErrSchemeMismatch) && !errutil.IsErrConnectionRefused(err) {
 			return nil, err
 		}
-		if insecure {
-			logrus.WithError(err).Warnf("server %q does not seem to support HTTPS, falling back to plain HTTP", refDomain)
+		if options.GOptions.InsecureRegistry {
+			log.G(ctx).WithError(err).Warnf("server %q does not seem to support HTTPS, falling back to plain HTTP", parsedReference.Domain)
 			dOpts = append(dOpts, dockerconfigresolver.WithPlainHTTP(true))
-			resolver, err = dockerconfigresolver.New(ctx, refDomain, dOpts...)
+			resolver, err = dockerconfigresolver.New(ctx, parsedReference.Domain, dOpts...)
 			if err != nil {
 				return nil, err
 			}
-			return PullImage(ctx, client, stdout, stderr, snapshotter, resolver, ref, ocispecPlatforms, unpack, quiet)
+			return PullImage(ctx, client, resolver, parsedReference.String(), options)
 		}
-		logrus.WithError(err).Errorf("server %q does not seem to support HTTPS", refDomain)
-		logrus.Info("Hint: you may want to try --insecure-registry to allow plain HTTP (if you are in a trusted network)")
+		log.G(ctx).WithError(err).Errorf("server %q does not seem to support HTTPS", parsedReference.Domain)
+		log.G(ctx).Info("Hint: you may want to try --insecure-registry to allow plain HTTP (if you are in a trusted network)")
 		return nil, err
 
 	}
@@ -167,25 +167,23 @@ func EnsureImage(ctx context.Context, client *containerd.Client, stdout, stderr 
 
 // ResolveDigest resolves `rawRef` and returns its descriptor digest.
 func ResolveDigest(ctx context.Context, rawRef string, insecure bool, hostsDirs []string) (string, error) {
-	named, err := refdocker.ParseDockerRef(rawRef)
+	parsedReference, err := referenceutil.Parse(rawRef)
 	if err != nil {
 		return "", err
 	}
-	ref := named.String()
-	refDomain := refdocker.Domain(named)
 
 	var dOpts []dockerconfigresolver.Opt
 	if insecure {
-		logrus.Warnf("skipping verifying HTTPS certs for %q", refDomain)
+		log.G(ctx).Warnf("skipping verifying HTTPS certs for %q", parsedReference.Domain)
 		dOpts = append(dOpts, dockerconfigresolver.WithSkipVerifyCerts(true))
 	}
 	dOpts = append(dOpts, dockerconfigresolver.WithHostsDirs(hostsDirs))
-	resolver, err := dockerconfigresolver.New(ctx, refDomain, dOpts...)
+	resolver, err := dockerconfigresolver.New(ctx, parsedReference.Domain, dOpts...)
 	if err != nil {
 		return "", err
 	}
 
-	_, desc, err := resolver.Resolve(ctx, ref)
+	_, desc, err := resolver.Resolve(ctx, parsedReference.String())
 	if err != nil {
 		return "", err
 	}
@@ -194,7 +192,7 @@ func ResolveDigest(ctx context.Context, rawRef string, insecure bool, hostsDirs 
 }
 
 // PullImage pulls an image using the specified resolver.
-func PullImage(ctx context.Context, client *containerd.Client, stdout, stderr io.Writer, snapshotter string, resolver remotes.Resolver, ref string, ocispecPlatforms []ocispec.Platform, unpack *bool, quiet bool) (*EnsuredImage, error) {
+func PullImage(ctx context.Context, client *containerd.Client, resolver remotes.Resolver, ref string, options types.ImagePullOptions) (*EnsuredImage, error) {
 	ctx, done, err := client.WithLease(ctx)
 	if err != nil {
 		return nil, err
@@ -205,24 +203,27 @@ func PullImage(ctx context.Context, client *containerd.Client, stdout, stderr io
 	config := &pull.Config{
 		Resolver:   resolver,
 		RemoteOpts: []containerd.RemoteOpt{},
-		Platforms:  ocispecPlatforms, // empty for all-platforms
+		Platforms:  options.OCISpecPlatform, // empty for all-platforms
 	}
-	if !quiet {
-		config.ProgressOutput = stderr
+	if !options.Quiet {
+		config.ProgressOutput = options.Stderr
+		if options.ProgressOutputToStdout {
+			config.ProgressOutput = options.Stdout
+		}
 	}
 
 	// unpack(B) if given 1 platform unless specified by `unpack`
-	unpackB := len(ocispecPlatforms) == 1
-	if unpack != nil {
-		unpackB = *unpack
-		if unpackB && len(ocispecPlatforms) != 1 {
+	unpackB := len(options.OCISpecPlatform) == 1
+	if options.Unpack != nil {
+		unpackB = *options.Unpack
+		if unpackB && len(options.OCISpecPlatform) != 1 {
 			return nil, fmt.Errorf("unpacking requires a single platform to be specified (e.g., --platform=amd64)")
 		}
 	}
 
-	snOpt := getSnapshotterOpts(snapshotter)
+	snOpt := getSnapshotterOpts(options.GOptions.Snapshotter)
 	if unpackB {
-		logrus.Debugf("The image will be unpacked for platform %q, snapshotter %q.", ocispecPlatforms[0], snapshotter)
+		log.G(ctx).Debugf("The image will be unpacked for platform %q, snapshotter %q.", options.OCISpecPlatform[0], options.GOptions.Snapshotter)
 		imgcryptPayload := imgcrypt.Payload{}
 		imgcryptUnpackOpt := encryption.WithUnpackConfigApplyOpts(encryption.WithDecryptedUnpack(&imgcryptPayload))
 		config.RemoteOpts = append(config.RemoteOpts,
@@ -230,9 +231,9 @@ func PullImage(ctx context.Context, client *containerd.Client, stdout, stderr io
 			containerd.WithUnpackOpts([]containerd.UnpackOpt{imgcryptUnpackOpt}))
 
 		// different remote snapshotters will update pull.Config separately
-		snOpt.apply(config, ref)
+		snOpt.apply(config, ref, options.RFlags)
 	} else {
-		logrus.Debugf("The image will not be unpacked. Platforms=%v.", ocispecPlatforms)
+		log.G(ctx).Debugf("The image will not be unpacked. Platforms=%v.", options.OCISpecPlatform)
 	}
 
 	containerdImage, err = pull.Pull(ctx, client, ref, config)
@@ -247,7 +248,7 @@ func PullImage(ctx context.Context, client *containerd.Client, stdout, stderr io
 		Ref:         ref,
 		Image:       containerdImage,
 		ImageConfig: *imgConfig,
-		Snapshotter: snapshotter,
+		Snapshotter: options.GOptions.Snapshotter,
 		Remote:      snOpt.isRemote(),
 	}
 	return res, nil
@@ -358,45 +359,47 @@ func ReadImageConfig(ctx context.Context, img containerd.Image) (ocispec.Image, 
 
 // ParseRepoTag parses raw `imgName` to repository and tag.
 func ParseRepoTag(imgName string) (string, string) {
-	logrus.Debugf("raw image name=%q", imgName)
+	log.L.Debugf("raw image name=%q", imgName)
 
-	ref, err := refdocker.ParseDockerRef(imgName)
+	parsedReference, err := referenceutil.Parse(imgName)
 	if err != nil {
-		logrus.WithError(err).Debugf("unparsable image name %q", imgName)
+		log.L.WithError(err).Debugf("unparsable image name %q", imgName)
 		return "", ""
 	}
 
-	var tag string
-
-	if tagged, ok := ref.(refdocker.Tagged); ok {
-		tag = tagged.Tag()
-	}
-	repository := refdocker.FamiliarName(ref)
-
-	return repository, tag
+	return parsedReference.FamiliarName(), parsedReference.Tag
 }
 
-type snapshotKey string
+// ResourceUsage will return:
+// - the Usage value of the resource referenced by ID
+// - the cumulative Usage value of the resource, and all parents, recursively
+// Typically, for a running container, this will equal the size of the read-write layer, plus the sum of the size of all layers in the base image
+func ResourceUsage(ctx context.Context, snapshotter snapshots.Snapshotter, resourceID string) (snapshots.Usage, snapshots.Usage, error) {
+	first := snapshots.Usage{}
+	total := snapshots.Usage{}
+	var info snapshots.Info
+	for next := resourceID; next != ""; next = info.Parent {
+		// Get the resource usage info
+		usage, err := snapshotter.Usage(ctx, next)
+		if err != nil {
+			return first, total, err
+		}
+		// In case that's the first one, store that
+		if next == resourceID {
+			first = usage
+		}
+		// And increment totals
+		total.Size += usage.Size
+		total.Inodes += usage.Inodes
 
-// recursive function to calculate total usage of key's parent
-func (key snapshotKey) add(ctx context.Context, s snapshots.Snapshotter, usage *snapshots.Usage) error {
-	if key == "" {
-		return nil
+		// Now, get the parent, if any and iterate
+		info, err = snapshotter.Stat(ctx, next)
+		if err != nil {
+			return first, total, err
+		}
 	}
-	u, err := s.Usage(ctx, string(key))
-	if err != nil {
-		return err
-	}
 
-	usage.Add(u)
-
-	info, err := s.Stat(ctx, string(key))
-	if err != nil {
-		return err
-	}
-
-	key = snapshotKey(info.Parent)
-	return key.add(ctx, s, usage)
+	return first, total, nil
 }
 
 // UnpackedImageSize is the size of the unpacked snapshots.
@@ -408,23 +411,56 @@ func UnpackedImageSize(ctx context.Context, s snapshots.Snapshotter, img contain
 	}
 
 	chainID := identity.ChainID(diffIDs).String()
-	usage, err := s.Usage(ctx, chainID)
+	_, total, err := ResourceUsage(ctx, s, chainID)
+
+	return total.Size, err
+}
+
+// GetUnusedImages returns the list of all images which are not referenced by a container.
+func GetUnusedImages(ctx context.Context, client *containerd.Client, filters ...Filter) ([]images.Image, error) {
+	var (
+		imageStore     = client.ImageService()
+		containerStore = client.ContainerService()
+	)
+
+	containers, err := containerStore.List(ctx)
 	if err != nil {
-		if errdefs.IsNotFound(err) {
-			logrus.WithError(err).Debugf("image %q seems not unpacked", img.Name())
-			return 0, nil
+		return []images.Image{}, err
+	}
+
+	usedImages := make(map[string]struct{})
+	for _, container := range containers {
+		usedImages[container.Image] = struct{}{}
+	}
+
+	allImages, err := imageStore.List(ctx)
+	if err != nil {
+		return []images.Image{}, err
+	}
+
+	unusedImages := make([]images.Image, 0, len(allImages))
+	for _, image := range allImages {
+		if _, ok := usedImages[image.Name]; ok {
+			continue
 		}
-		return 0, err
+		unusedImages = append(unusedImages, image)
 	}
 
-	info, err := s.Stat(ctx, chainID)
+	return ApplyFilters(unusedImages, filters...)
+}
+
+// GetDanglingImages returns the list of all images which are not tagged.
+func GetDanglingImages(ctx context.Context, client *containerd.Client, filters ...Filter) ([]images.Image, error) {
+	var (
+		imageStore = client.ImageService()
+	)
+
+	allImages, err := imageStore.List(ctx)
 	if err != nil {
-		return 0, err
+		return []images.Image{}, err
 	}
 
-	//add ChainID's parent usage to the total usage
-	if err := snapshotKey(info.Parent).add(ctx, s, &usage); err != nil {
-		return 0, err
-	}
-	return usage.Size, nil
+	filters = append([]Filter{FilterDanglingImages()}, filters...)
+
+	return ApplyFilters(allImages, filters...)
 }

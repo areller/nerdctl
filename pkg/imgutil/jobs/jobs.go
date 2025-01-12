@@ -24,13 +24,14 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/pkg/progress"
-	"github.com/containerd/containerd/remotes"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/pkg/progress"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
 )
 
 // ShowProgress continuously updates the output with job progress
@@ -101,11 +102,10 @@ outer:
 						if !errdefs.IsNotFound(err) {
 							log.G(ctx).WithError(err).Error("failed to get content info")
 							continue outer
-						} else {
-							statuses[key] = StatusInfo{
-								Ref:    key,
-								Status: StatusWaiting,
-							}
+						}
+						statuses[key] = StatusInfo{
+							Ref:    key,
+							Status: StatusWaiting,
 						}
 					} else if info.CreatedAt.After(start) {
 						statuses[key] = StatusInfo{

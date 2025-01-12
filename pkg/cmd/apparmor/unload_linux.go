@@ -17,11 +17,12 @@
 package apparmor
 
 import (
-	"github.com/containerd/nerdctl/pkg/apparmorutil"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/apparmorutil"
 )
 
 func Unload(target string) error {
-	logrus.Infof("Unloading profile %q", target)
+	log.L.Infof("Unloading profile %q", target)
 	return apparmorutil.Unload(target)
 }

@@ -20,13 +20,15 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/containerd/cgroups"
-	"github.com/containerd/nerdctl/pkg/apparmorutil"
-	"github.com/containerd/nerdctl/pkg/defaults"
-	"github.com/containerd/nerdctl/pkg/inspecttypes/dockercompat"
-	"github.com/containerd/nerdctl/pkg/rootlessutil"
-	"github.com/docker/docker/pkg/sysinfo"
-	"github.com/docker/docker/pkg/system"
+	"github.com/docker/docker/pkg/meminfo"
+
+	"github.com/containerd/cgroups/v3"
+
+	"github.com/containerd/nerdctl/v2/pkg/apparmorutil"
+	"github.com/containerd/nerdctl/v2/pkg/defaults"
+	"github.com/containerd/nerdctl/v2/pkg/inspecttypes/dockercompat"
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
+	"github.com/containerd/nerdctl/v2/pkg/sysinfo"
 )
 
 const UnameO = "GNU/Linux"
@@ -49,7 +51,7 @@ WARNING: AppArmor profile %q is not loaded.
          This warning is negligible if you do not intend to use AppArmor.`), defaults.AppArmorProfileName))
 		}
 	}
-	info.SecurityOptions = append(info.SecurityOptions, "name=seccomp,profile=default")
+	info.SecurityOptions = append(info.SecurityOptions, "name=seccomp,profile="+defaults.SeccompProfileName)
 	if defaults.CgroupnsMode() == "private" {
 		info.SecurityOptions = append(info.SecurityOptions, "name=cgroupns")
 	}
@@ -120,7 +122,7 @@ func fulfillPlatformInfo(info *dockercompat.Info) {
 		info.Warnings = append(info.Warnings, "WARNING: bridge-nf-call-ip6tables is disabled")
 	}
 	info.NCPU = sysinfo.NumCPU()
-	memLimit, err := system.ReadMemInfo()
+	memLimit, err := meminfo.Read()
 	if err != nil {
 		info.Warnings = append(info.Warnings, fmt.Sprintf("failed to read mem info: %v", err))
 	} else {

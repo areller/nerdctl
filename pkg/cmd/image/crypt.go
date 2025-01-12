@@ -21,15 +21,17 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/images/converter"
-	"github.com/containerd/imgcrypt/images/encryption"
-	"github.com/containerd/imgcrypt/images/encryption/parsehelpers"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/platformutil"
-	"github.com/containerd/nerdctl/pkg/referenceutil"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images/converter"
+	"github.com/containerd/imgcrypt/v2/images/encryption"
+	"github.com/containerd/imgcrypt/v2/images/encryption/parsehelpers"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/platformutil"
+	"github.com/containerd/nerdctl/v2/pkg/referenceutil"
 )
 
 func Crypt(ctx context.Context, client *containerd.Client, srcRawRef, targetRawRef string, encrypt bool, options types.ImageCryptOptions) error {
@@ -38,17 +40,17 @@ func Crypt(ctx context.Context, client *containerd.Client, srcRawRef, targetRawR
 		return errors.New("src and target image need to be specified")
 	}
 
-	srcNamed, err := referenceutil.ParseAny(srcRawRef)
+	parsedRerefence, err := referenceutil.Parse(srcRawRef)
 	if err != nil {
 		return err
 	}
-	srcRef := srcNamed.String()
+	srcRef := parsedRerefence.String()
 
-	targetNamed, err := referenceutil.ParseDockerRef(targetRawRef)
+	parsedRerefence, err = referenceutil.Parse(targetRawRef)
 	if err != nil {
 		return err
 	}
-	targetRef := targetNamed.String()
+	targetRef := parsedRerefence.String()
 
 	platMC, err := platformutil.NewMatchComparer(options.AllPlatforms, options.Platforms)
 	if err != nil {

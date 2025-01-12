@@ -19,20 +19,22 @@ package signutil
 import (
 	"bufio"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"strings"
 
-	"github.com/containerd/nerdctl/pkg/imgutil"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/imgutil"
 )
 
 // SignCosign signs an image(`rawRef`) using a cosign private key (`keyRef`)
 func SignCosign(rawRef string, keyRef string) error {
 	cosignExecutable, err := exec.LookPath("cosign")
 	if err != nil {
-		logrus.WithError(err).Error("cosign executable not found in path $PATH")
-		logrus.Info("you might consider installing cosign from: https://docs.sigstore.dev/cosign/installation")
+		log.L.WithError(err).Error("cosign executable not found in path $PATH")
+		log.L.Info("you might consider installing cosign from: https://docs.sigstore.dev/cosign/installation")
 		return err
 	}
 
@@ -49,26 +51,24 @@ func SignCosign(rawRef string, keyRef string) error {
 	cosignCmd.Args = append(cosignCmd.Args, "--yes")
 	cosignCmd.Args = append(cosignCmd.Args, rawRef)
 
-	logrus.Debugf("running %s %v", cosignExecutable, cosignCmd.Args)
+	log.L.Debugf("running %s %v", cosignExecutable, cosignCmd.Args)
 
 	err = processCosignIO(cosignCmd)
 	if err != nil {
 		return err
 	}
 
-	if err := cosignCmd.Wait(); err != nil {
-		return err
-	}
-
-	return nil
+	return cosignCmd.Wait()
 }
 
 // VerifyCosign verifies an image(`rawRef`) with a cosign public key(`keyRef`)
 // `hostsDirs` are used to resolve image `rawRef`
-func VerifyCosign(ctx context.Context, rawRef string, keyRef string, hostsDirs []string) (string, error) {
+// Either --cosign-certificate-identity or --cosign-certificate-identity-regexp and either --cosign-certificate-oidc-issuer or --cosign-certificate-oidc-issuer-regexp must be set for keyless flows.
+func VerifyCosign(ctx context.Context, rawRef string, keyRef string, hostsDirs []string,
+	certIdentity string, certIdentityRegexp string, certOidcIssuer string, certOidcIssuerRegexp string) (string, error) {
 	digest, err := imgutil.ResolveDigest(ctx, rawRef, false, hostsDirs)
 	if err != nil {
-		logrus.WithError(err).Errorf("unable to resolve digest for an image %s: %v", rawRef, err)
+		log.G(ctx).WithError(err).Errorf("unable to resolve digest for an image %s: %v", rawRef, err)
 		return rawRef, err
 	}
 	ref := rawRef
@@ -76,12 +76,12 @@ func VerifyCosign(ctx context.Context, rawRef string, keyRef string, hostsDirs [
 		ref += "@" + digest
 	}
 
-	logrus.Debugf("verifying image: %s", ref)
+	log.G(ctx).Debugf("verifying image: %s", ref)
 
 	cosignExecutable, err := exec.LookPath("cosign")
 	if err != nil {
-		logrus.WithError(err).Error("cosign executable not found in path $PATH")
-		logrus.Info("you might consider installing cosign from: https://docs.sigstore.dev/cosign/installation")
+		log.G(ctx).WithError(err).Error("cosign executable not found in path $PATH")
+		log.G(ctx).Info("you might consider installing cosign from: https://docs.sigstore.dev/cosign/installation")
 		return ref, err
 	}
 
@@ -92,12 +92,30 @@ func VerifyCosign(ctx context.Context, rawRef string, keyRef string, hostsDirs [
 	if keyRef != "" {
 		cosignCmd.Args = append(cosignCmd.Args, "--key", keyRef)
 	} else {
+		if certIdentity == "" && certIdentityRegexp == "" {
+			return ref, errors.New("--cosign-certificate-identity or --cosign-certificate-identity-regexp is required for Cosign verification in keyless mode")
+		}
+		if certIdentity != "" {
+			cosignCmd.Args = append(cosignCmd.Args, "--certificate-identity", certIdentity)
+		}
+		if certIdentityRegexp != "" {
+			cosignCmd.Args = append(cosignCmd.Args, "--certificate-identity-regexp", certIdentityRegexp)
+		}
+		if certOidcIssuer == "" && certOidcIssuerRegexp == "" {
+			return ref, errors.New("--cosign-certificate-oidc-issuer or --cosign-certificate-oidc-issuer-regexp is required for Cosign verification in keyless mode")
+		}
+		if certOidcIssuer != "" {
+			cosignCmd.Args = append(cosignCmd.Args, "--certificate-oidc-issuer", certOidcIssuer)
+		}
+		if certOidcIssuerRegexp != "" {
+			cosignCmd.Args = append(cosignCmd.Args, "--certificate-oidc-issuer-regexp", certOidcIssuerRegexp)
+		}
 		cosignCmd.Env = append(cosignCmd.Env, "COSIGN_EXPERIMENTAL=true")
 	}
 
 	cosignCmd.Args = append(cosignCmd.Args, ref)
 
-	logrus.Debugf("running %s %v", cosignExecutable, cosignCmd.Args)
+	log.G(ctx).Debugf("running %s %v", cosignExecutable, cosignCmd.Args)
 
 	err = processCosignIO(cosignCmd)
 	if err != nil {
@@ -113,11 +131,11 @@ func VerifyCosign(ctx context.Context, rawRef string, keyRef string, hostsDirs [
 func processCosignIO(cosignCmd *exec.Cmd) error {
 	stdout, err := cosignCmd.StdoutPipe()
 	if err != nil {
-		logrus.Warn("cosign: " + err.Error())
+		log.L.Warn("cosign: " + err.Error())
 	}
 	stderr, err := cosignCmd.StderrPipe()
 	if err != nil {
-		logrus.Warn("cosign: " + err.Error())
+		log.L.Warn("cosign: " + err.Error())
 	}
 	if err := cosignCmd.Start(); err != nil {
 		// only return err if it's critical (cosign start failed.)
@@ -126,18 +144,18 @@ func processCosignIO(cosignCmd *exec.Cmd) error {
 
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
-		logrus.Info("cosign: " + scanner.Text())
+		log.L.Info("cosign: " + scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
-		logrus.Warn("cosign: " + err.Error())
+		log.L.Warn("cosign: " + err.Error())
 	}
 
 	errScanner := bufio.NewScanner(stderr)
 	for errScanner.Scan() {
-		logrus.Info("cosign: " + errScanner.Text())
+		log.L.Info("cosign: " + errScanner.Text())
 	}
 	if err := errScanner.Err(); err != nil {
-		logrus.Warn("cosign: " + err.Error())
+		log.L.Warn("cosign: " + err.Error())
 	}
 
 	return nil

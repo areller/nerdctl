@@ -61,10 +61,7 @@ Configuration of the default network `bridge` of Linux:
 nerdctl >= 0.18 sets the `ingressPolicy` to `same-bridge` when `firewall` plugin >= 1.1.0 is installed.
 This `ingressPolicy` replaces the CNI `isolation` plugin used in nerdctl <= 0.17.
 
-When the `isolation` plugin is found, nerdctl uses the `isolation` plugin instead of `ingressPolicy`.
-The `isolation` plugin has been deprecated, and a future version of `nerdctl` will solely support `ingressPolicy`.
-
-When neither of `firewall` plugin >= 1.1.0 or `isolation` plugin is found, nerdctl does not enable the bridge isolation.
+When `firewall` plugin >= 1.1.0 is not found, nerdctl does not enable the bridge isolation.
 This means a container in `--net=foo` can connect to a container in `--net=bar`.
 
 ## macvlan/IPvlan networks
@@ -93,10 +90,42 @@ an easier way is to use DHCP to assign the IP:
 
 Using `--driver ipvlan` can create `ipvlan` network, the default mode for IPvlan is `l2`.
 
+## DHCP host-name and other DHCP options
+
+Nerdctl automatically sets the DHCP host-name option to the hostname value of the container.
+
+Furthermore, on network creation, nerdctl supports the ability to set other DHCP options through `--ipam-options`.
+
+Currently, the following options are supported by the DHCP plugin:
+```
+dhcp-client-identifier
+subnet-mask
+routers
+user-class
+vendor-class-identifier
+```
+
+For example:
+```
+# nerdctl network create --driver macvlan \
+    --ipam-driver dhcp \
+    --ipam-opt 'vendor-class-identifier={"type": "provide", "value": "Hey! Its me!"}' \
+    my-dhcp-net
+```
+
 ## Custom networks
 
 You can also customize your CNI network by providing configuration files.
-For example you have one configuration file(`/etc/cni/net.d/10-mynet.conf`)
+
+When rootful, the expected root location is `/etc/cni/net.d`.
+For rootless, the expected root location is `~/.config/cni/net.d/`
+
+Configuration files (like `10-mynet.conf`) can be placed either in the root location,
+or under a subfolder.
+If in the root location, this network will be available to all nerdctl namespaces.
+If placed in a subfolder, it will be available only to the identically named namespace.
+
+For example, you have one configuration file(`/etc/cni/net.d/10-mynet.conf`)
 for `bridge` network:
 
 ```json
@@ -118,7 +147,7 @@ for `bridge` network:
 ```
 
 This will configure a new CNI network with the name `mynet`, and you can use
-this network to create a container:
+this network to create a container in any namespace:
 
 ```console
 # nerdctl run -it --net mynet --rm alpine ip addr show

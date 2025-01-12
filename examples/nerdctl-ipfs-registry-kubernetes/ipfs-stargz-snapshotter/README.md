@@ -49,7 +49,7 @@ Prepare `kind-worker` (1st node) for importing an image to IPFS
 ```console
 $ docker exec -it kind-worker /bin/bash
 (kind-worker)# NERDCTL_VERSION=0.23.0
-(kind-worker)# curl -sSL --output /tmp/nerdctl.tgz https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-amd64.tar.gz
+(kind-worker)# curl -o /tmp/nerdctl.tgz -fsSL --proto '=https' --tlsv1.2 https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-amd64.tar.gz
 (kind-worker)# tar zxvf /tmp/nerdctl.tgz -C /usr/local/bin/
 ```
 
@@ -68,7 +68,7 @@ $ docker exec -it kind-worker /bin/bash
 
 The eStargz image added to `kind-worker` is shared to `kind-worker2` via IPFS.
 You can perform lazy pulling of this eStargz image among nodes using the following manifest.
-CID of the pushed image is printed when `nerdctl push` is succeded (we assume that the image is added to IPFS as CID `bafkreidqrxutnnuc3oilje27px5o3gggzrfyomumrprcavr7nquoy3cdje`).
+CID of the pushed image is printed when `nerdctl push` is succeeded (we assume that the image is added to IPFS as CID `bafkreidqrxutnnuc3oilje27px5o3gggzrfyomumrprcavr7nquoy3cdje`).
 
 
 ```console

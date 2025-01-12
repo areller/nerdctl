@@ -17,11 +17,14 @@
 package defaults
 
 import (
-	gocni "github.com/containerd/go-cni"
+	"github.com/containerd/go-cni"
 )
 
-const AppArmorProfileName = ""
-const Runtime = "wtf.sbk.runj.v1"
+const (
+	AppArmorProfileName = ""
+	SeccompProfileName  = ""
+	Runtime             = "wtf.sbk.runj.v1"
+)
 
 func DataRoot() string {
 	return "/var/lib/nerdctl"
@@ -29,19 +32,15 @@ func DataRoot() string {
 
 func CNIPath() string {
 	// default: /opt/cni/bin
-	return gocni.DefaultCNIDir
+	return cni.DefaultCNIDir
 }
 
 func CNINetConfPath() string {
-	return gocni.DefaultNetDir
+	return cni.DefaultNetDir
 }
 
 func CNIRuntimeDir() string {
 	return "/run/cni"
-}
-
-func BuildKitHost() string {
-	return "unix:///run/buildkit/buildkitd.sock"
 }
 
 func CgroupManager() string {

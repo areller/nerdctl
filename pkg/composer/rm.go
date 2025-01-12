@@ -21,13 +21,13 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/composer/serviceparser"
-	"github.com/containerd/nerdctl/pkg/formatter"
-	"github.com/containerd/nerdctl/pkg/labels"
-	"github.com/containerd/nerdctl/pkg/strutil"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/log"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/nerdctl/v2/pkg/composer/serviceparser"
+	"github.com/containerd/nerdctl/v2/pkg/formatter"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
 )
 
 // RemoveOptions stores all options when removing compose containers:
@@ -80,14 +80,14 @@ func (c *Composer) removeContainers(ctx context.Context, containers []containerd
 			if !opt.Stop {
 				cStatus := formatter.ContainerStatus(ctx, container)
 				if strings.HasPrefix(cStatus, "Up") {
-					logrus.Warnf("Removing container %s failed: container still running.", info.Labels[labels.Name])
+					log.G(ctx).Warnf("Removing container %s failed: container still running.", info.Labels[labels.Name])
 					return
 				}
 			}
 
-			logrus.Infof("Removing container %s", info.Labels[labels.Name])
+			log.G(ctx).Infof("Removing container %s", info.Labels[labels.Name])
 			if err := c.runNerdctlCmd(ctx, append(args, container.ID())...); err != nil {
-				logrus.Warn(err)
+				log.G(ctx).Warn(err)
 			}
 		}()
 	}
@@ -104,9 +104,9 @@ func (c *Composer) removeContainersFromParsedServices(ctx context.Context, conta
 		rmWG.Add(1)
 		go func() {
 			defer rmWG.Done()
-			logrus.Infof("Removing container %s", container.Name)
+			log.G(ctx).Infof("Removing container %s", container.Name)
 			if err := c.runNerdctlCmd(ctx, "rm", "-f", id); err != nil {
-				logrus.Warn(err)
+				log.G(ctx).Warn(err)
 			}
 		}()
 	}

@@ -23,25 +23,34 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/cmd/volume"
-	"github.com/containerd/nerdctl/pkg/composer"
-	"github.com/containerd/nerdctl/pkg/composer/serviceparser"
-	"github.com/containerd/nerdctl/pkg/imgutil"
-	"github.com/containerd/nerdctl/pkg/ipfs"
-	"github.com/containerd/nerdctl/pkg/netutil"
-	"github.com/containerd/nerdctl/pkg/referenceutil"
-	"github.com/containerd/nerdctl/pkg/signutil"
-	"github.com/containerd/nerdctl/pkg/strutil"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/platforms"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/cmd/volume"
+	"github.com/containerd/nerdctl/v2/pkg/composer"
+	"github.com/containerd/nerdctl/v2/pkg/composer/serviceparser"
+	"github.com/containerd/nerdctl/v2/pkg/imgutil"
+	"github.com/containerd/nerdctl/v2/pkg/ipfs"
+	"github.com/containerd/nerdctl/v2/pkg/netutil"
+	"github.com/containerd/nerdctl/v2/pkg/referenceutil"
+	"github.com/containerd/nerdctl/v2/pkg/signutil"
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
 )
+
+//nolint:unused
+var locked *os.File
 
 // New returns a new *composer.Composer.
 func New(client *containerd.Client, globalOptions types.GlobalCommandOptions, options composer.Options, stdout, stderr io.Writer) (*composer.Composer, error) {
-	cniEnv, err := netutil.NewCNIEnv(globalOptions.CNIPath, globalOptions.CNINetConfPath, netutil.WithDefaultNetwork())
+	if err := composer.Lock(globalOptions.DataRoot, globalOptions.Address); err != nil {
+		return nil, err
+	}
+
+	cniEnv, err := netutil.NewCNIEnv(globalOptions.CNIPath, globalOptions.CNINetConfPath, netutil.WithNamespace(globalOptions.Namespace), netutil.WithDefaultNetwork(globalOptions.BridgeIP))
 	if err != nil {
 		return nil, err
 	}
@@ -75,22 +84,15 @@ func New(client *containerd.Client, globalOptions types.GlobalCommandOptions, op
 	if err != nil {
 		return nil, err
 	}
-	options.VolumeExists = func(volName string) (bool, error) {
-		if _, volGetErr := volStore.Get(volName, false); volGetErr == nil {
-			return true, nil
-		} else if errors.Is(volGetErr, errdefs.ErrNotFound) {
-			return false, nil
-		} else {
-			return false, volGetErr
-		}
-	}
+	// FIXME: this is racy. See note in up_volume.go
+	options.VolumeExists = volStore.Exists
 
 	options.ImageExists = func(ctx context.Context, rawRef string) (bool, error) {
-		refNamed, err := referenceutil.ParseAny(rawRef)
+		parsedReference, err := referenceutil.Parse(rawRef)
 		if err != nil {
 			return false, err
 		}
-		ref := refNamed.String()
+		ref := parsedReference.String()
 		if _, err := client.ImageService().Get(ctx, ref); err != nil {
 			if errors.Is(err, errdefs.ErrNotFound) {
 				return false, nil
@@ -110,8 +112,23 @@ func New(client *containerd.Client, globalOptions types.GlobalCommandOptions, op
 			ocispecPlatforms = []ocispec.Platform{parsed} // no append
 		}
 
-		// IPFS reference
-		if scheme, ref, err := referenceutil.ParseIPFSRefWithScheme(imageName); err == nil {
+		imgPullOpts := types.ImagePullOptions{
+			GOptions:        globalOptions,
+			OCISpecPlatform: ocispecPlatforms,
+			Unpack:          nil,
+			Mode:            pullMode,
+			Quiet:           quiet,
+			RFlags:          types.RemoteSnapshotterFlags{},
+			Stdout:          stdout,
+			Stderr:          stderr,
+		}
+
+		parsedReference, err := referenceutil.Parse(imageName)
+		if err != nil {
+			return err
+		}
+
+		if parsedReference.Protocol != "" {
 			var ipfsPath string
 			if ipfsAddress := options.IPFSAddress; ipfsAddress != "" {
 				dir, err := os.MkdirTemp("", "apidirtmp")
@@ -124,8 +141,7 @@ func New(client *containerd.Client, globalOptions types.GlobalCommandOptions, op
 				}
 				ipfsPath = dir
 			}
-			_, err = ipfs.EnsureImage(ctx, client, stdout, stderr, globalOptions.Snapshotter, scheme, ref,
-				pullMode, ocispecPlatforms, nil, quiet, ipfsPath)
+			_, err = ipfs.EnsureImage(ctx, client, string(parsedReference.Protocol), parsedReference.String(), ipfsPath, imgPullOpts)
 			return err
 		}
 
@@ -135,8 +151,7 @@ func New(client *containerd.Client, globalOptions types.GlobalCommandOptions, op
 			return err
 		}
 
-		_, err = imgutil.EnsureImage(ctx, client, stdout, stderr, globalOptions.Snapshotter, ref,
-			pullMode, globalOptions.InsecureRegistry, globalOptions.HostsDir, ocispecPlatforms, nil, quiet)
+		_, err = imgutil.EnsureImage(ctx, client, ref, imgPullOpts)
 		return err
 	}
 
@@ -154,6 +169,18 @@ func imageVerifyOptionsFromCompose(ps *serviceparser.Service) types.ImageVerifyO
 	// for cosign, if key is given, use key mode, otherwise use keyless mode.
 	if keyVal, ok := ps.Unparsed.Extensions[serviceparser.ComposeCosignPublicKey]; ok {
 		opt.CosignKey = keyVal.(string)
+	}
+	if ciVal, ok := ps.Unparsed.Extensions[serviceparser.ComposeCosignCertificateIdentity]; ok {
+		opt.CosignCertificateIdentity = ciVal.(string)
+	}
+	if cirVal, ok := ps.Unparsed.Extensions[serviceparser.ComposeCosignCertificateIdentityRegexp]; ok {
+		opt.CosignCertificateIdentityRegexp = cirVal.(string)
+	}
+	if coiVal, ok := ps.Unparsed.Extensions[serviceparser.ComposeCosignCertificateOidcIssuer]; ok {
+		opt.CosignCertificateOidcIssuer = coiVal.(string)
+	}
+	if coirVal, ok := ps.Unparsed.Extensions[serviceparser.ComposeCosignCertificateOidcIssuerRegexp]; ok {
+		opt.CosignCertificateOidcIssuerRegexp = coirVal.(string)
 	}
 	return opt
 }

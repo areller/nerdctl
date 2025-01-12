@@ -1,11 +1,11 @@
 ---
 run:
   concurrency: 6
-  deadline: 5m
+  timeout: 5m
 linters:
   disable-all: true
   enable:
-    - depguard
+    # - depguard
     - gofmt
     - goimports
     - govet
@@ -134,3 +134,9 @@ linters-settings:
       - typeUnparen
       - unnamedResult
       - unnecessaryBlock
+
+issues:
+  exclude-rules:
+    - linters:
+        - revive
+      text: "unused-parameter"

@@ -19,11 +19,17 @@ package subnet
 import (
 	"fmt"
 	"net"
+
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
 )
 
 func GetLiveNetworkSubnets() ([]*net.IPNet, error) {
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
+	var addrs []net.Addr
+	if err := rootlessutil.WithDetachedNetNSIfAny(func() error {
+		var err2 error
+		addrs, err2 = net.InterfaceAddrs()
+		return err2
+	}); err != nil {
 		return nil, err
 	}
 	nets := make([]*net.IPNet, 0, len(addrs))
@@ -105,12 +111,12 @@ func LastIPInSubnet(addr *net.IPNet) (net.IP, error) {
 	}
 	ones, bits := cidr.Mask.Size()
 	if ones == bits {
-		return cidr.IP, err
+		return cidr.IP, nil
 	}
 	for i := range cidr.IP {
 		cidr.IP[i] = cidr.IP[i] | ^cidr.Mask[i]
 	}
-	return cidr.IP, err
+	return cidr.IP, nil
 }
 
 // firstIPInSubnet gets the first IP in a subnet
@@ -123,8 +129,8 @@ func FirstIPInSubnet(addr *net.IPNet) (net.IP, error) {
 	}
 	ones, bits := cidr.Mask.Size()
 	if ones == bits {
-		return cidr.IP, err
+		return cidr.IP, nil
 	}
 	cidr.IP[len(cidr.IP)-1]++
-	return cidr.IP, err
+	return cidr.IP, nil
 }

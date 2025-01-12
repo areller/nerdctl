@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build unix
 
 /*
    Copyright The containerd Authors.
@@ -19,18 +19,19 @@
 package consoleutil
 
 import (
-	gocontext "context"
+	"context"
 	"os"
 	"os/signal"
 
-	"github.com/containerd/console"
-	"github.com/containerd/containerd/log"
 	"golang.org/x/sys/unix"
+
+	"github.com/containerd/console"
+	"github.com/containerd/log"
 )
 
 // HandleConsoleResize resizes the console.
 // From https://github.com/containerd/containerd/blob/v1.7.0-rc.2/cmd/ctr/commands/tasks/tasks_unix.go#L43-L68
-func HandleConsoleResize(ctx gocontext.Context, task resizer, con console.Console) error {
+func HandleConsoleResize(ctx context.Context, task resizer, con console.Console) error {
 	// do an initial resize of the console
 	size, err := con.Size()
 	if err != nil {

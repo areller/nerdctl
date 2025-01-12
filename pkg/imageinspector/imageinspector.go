@@ -19,22 +19,24 @@ package imageinspector
 import (
 	"context"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/images"
-	imgutil "github.com/containerd/nerdctl/pkg/imgutil"
-	"github.com/containerd/nerdctl/pkg/inspecttypes/native"
-	"github.com/sirupsen/logrus"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/imgutil"
+	"github.com/containerd/nerdctl/v2/pkg/inspecttypes/native"
 )
 
 // Inspect inspects the image, for the platform specified in image.platform.
-func Inspect(ctx context.Context, client *containerd.Client, image images.Image, snapshotter string) (*native.Image, error) {
+func Inspect(ctx context.Context, client *containerd.Client, image images.Image, snapshotter snapshots.Snapshotter) (*native.Image, error) {
 
 	n := &native.Image{}
 
 	img := containerd.NewImage(client, image)
 	idx, idxDesc, err := imgutil.ReadIndex(ctx, img)
 	if err != nil {
-		logrus.WithError(err).WithField("id", image.Name).Warnf("failed to inspect index")
+		log.G(ctx).WithError(err).WithField("id", image.Name).Warnf("failed to inspect index")
 	} else {
 		n.IndexDesc = idxDesc
 		n.Index = idx
@@ -42,7 +44,7 @@ func Inspect(ctx context.Context, client *containerd.Client, image images.Image,
 
 	mani, maniDesc, err := imgutil.ReadManifest(ctx, img)
 	if err != nil {
-		logrus.WithError(err).WithField("id", image.Name).Warnf("failed to inspect manifest")
+		log.G(ctx).WithError(err).WithField("id", image.Name).Warnf("failed to inspect manifest")
 	} else {
 		n.ManifestDesc = maniDesc
 		n.Manifest = mani
@@ -50,15 +52,14 @@ func Inspect(ctx context.Context, client *containerd.Client, image images.Image,
 
 	imageConfig, imageConfigDesc, err := imgutil.ReadImageConfig(ctx, img)
 	if err != nil {
-		logrus.WithError(err).WithField("id", image.Name).Warnf("failed to inspect image config")
+		log.G(ctx).WithError(err).WithField("id", image.Name).Warnf("failed to inspect image config")
 	} else {
 		n.ImageConfigDesc = imageConfigDesc
 		n.ImageConfig = imageConfig
 	}
-	snapSvc := client.SnapshotService(snapshotter)
-	n.Size, err = imgutil.UnpackedImageSize(ctx, snapSvc, img)
+	n.Size, err = imgutil.UnpackedImageSize(ctx, snapshotter, img)
 	if err != nil {
-		logrus.WithError(err).WithField("id", image.Name).Warnf("failed to inspect calculate size")
+		log.G(ctx).WithError(err).WithField("id", image.Name).Warnf("failed to inspect calculate size")
 	}
 	n.Image = image
 

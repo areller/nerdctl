@@ -17,21 +17,26 @@
 package logging
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"time"
 
-	"github.com/containerd/containerd/runtime/v2/logging"
-	"github.com/containerd/nerdctl/pkg/logging/jsonfile"
-	"github.com/containerd/nerdctl/pkg/strutil"
 	"github.com/docker/go-units"
 	"github.com/fahedouch/go-logrotate"
-	"github.com/sirupsen/logrus"
+	"github.com/fsnotify/fsnotify"
+
+	"github.com/containerd/containerd/v2/core/runtime/v2/logging"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/logging/jsonfile"
+	"github.com/containerd/nerdctl/v2/pkg/logging/tail"
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
 )
 
 var JSONDriverLogOpts = []string{
@@ -48,7 +53,7 @@ type JSONLogger struct {
 func JSONFileLogOptsValidate(logOptMap map[string]string) error {
 	for key := range logOptMap {
 		if !strutil.InStringSlice(JSONDriverLogOpts, key) {
-			logrus.Warnf("log-opt %s is ignored for json-file log driver", key)
+			log.L.Warnf("log-opt %s is ignored for json-file log driver", key)
 		}
 	}
 	return nil
@@ -73,7 +78,7 @@ func (jsonLogger *JSONLogger) Init(dataStore, ns, id string) error {
 	return nil
 }
 
-func (jsonLogger *JSONLogger) PreProcess(dataStore string, config *logging.Config) error {
+func (jsonLogger *JSONLogger) PreProcess(ctx context.Context, dataStore string, config *logging.Config) error {
 	var jsonFilePath string
 	if logPath, ok := jsonLogger.Opts[LogPath]; ok {
 		jsonFilePath = logPath
@@ -83,10 +88,11 @@ func (jsonLogger *JSONLogger) PreProcess(dataStore string, config *logging.Confi
 	l := &logrotate.Logger{
 		Filename: jsonFilePath,
 	}
-	//maxSize Defaults to unlimited.
-	var capVal int64
-	capVal = -1
+	// MaxBytes is the maximum size in bytes of the log file before it gets
+	// rotated. If not set, it defaults to 100 MiB.
+	// see: https://github.com/fahedouch/go-logrotate/blob/6a8beddaea39b2b9c77109d7fa2fe92053c063e5/logrotate.go#L500
 	if capacity, ok := jsonLogger.Opts[MaxSize]; ok {
+		var capVal int64
 		var err error
 		capVal, err = units.FromHumanSize(capacity)
 		if err != nil {
@@ -95,8 +101,8 @@ func (jsonLogger *JSONLogger) PreProcess(dataStore string, config *logging.Confi
 		if capVal <= 0 {
 			return fmt.Errorf("max-size must be a positive number")
 		}
+		l.MaxBytes = capVal
 	}
-	l.MaxBytes = capVal
 	maxFile := 1
 	if maxFileString, ok := jsonLogger.Opts[MaxFile]; ok {
 		var err error
@@ -127,12 +133,18 @@ func (jsonLogger *JSONLogger) PostProcess() error {
 func viewLogsJSONFile(lvopts LogViewOptions, stdout, stderr io.Writer, stopChannel chan os.Signal) error {
 	logFilePath := jsonfile.Path(lvopts.DatastoreRootPath, lvopts.Namespace, lvopts.ContainerID)
 	if _, err := os.Stat(logFilePath); err != nil {
-		return fmt.Errorf("failed to stat JSON log file ")
+		// FIXME: this is a workaround for the actual issue, not a real solution
+		// https://github.com/containerd/nerdctl/issues/3187
+		if errors.Is(err, errdefs.ErrNotFound) {
+			log.L.Warnf("Racing log file creation. Pausing briefly.")
+			time.Sleep(200 * time.Millisecond)
+			_, err = os.Stat(logFilePath)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to stat JSON log file %w", err)
+		}
 	}
 
-	if checkExecutableAvailableInPath("tail") {
-		return viewLogsJSONFileThroughTailExec(lvopts, logFilePath, stdout, stderr, stopChannel)
-	}
 	return viewLogsJSONFileDirect(lvopts, logFilePath, stdout, stderr, stopChannel)
 }
 
@@ -144,89 +156,100 @@ func viewLogsJSONFileDirect(lvopts LogViewOptions, jsonLogFilePath string, stdou
 	if err != nil {
 		return err
 	}
-	defer fin.Close()
-	err = jsonfile.Decode(stdout, stderr, fin, lvopts.Timestamps, lvopts.Since, lvopts.Until, lvopts.Tail)
+	defer func() { fin.Close() }()
+
+	// Search start point based on tail line.
+	start, err := tail.FindTailLineStartIndex(fin, lvopts.Tail)
 	if err != nil {
-		return fmt.Errorf("error occurred while doing initial read of JSON logfile %q: %s", jsonLogFilePath, err)
+		return fmt.Errorf("failed to tail %d lines of JSON logfile %q: %w", lvopts.Tail, jsonLogFilePath, err)
 	}
 
-	if lvopts.Follow {
-		// Get the current file handler's seek.
-		lastPos, err := fin.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return fmt.Errorf("error occurred while trying to seek JSON logfile %q at position %d: %s", jsonLogFilePath, lastPos, err)
-		}
-		fin.Close()
-		for {
-			select {
-			case <-stopChannel:
-				logrus.Debugf("received stop signal while re-reading JSON logfile, returning")
+	if _, err := fin.Seek(start, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek in log file %q from %d position: %w", jsonLogFilePath, start, err)
+	}
+
+	limitedMode := (lvopts.Tail > 0) && (!lvopts.Follow)
+	limitedNum := lvopts.Tail
+	var stop bool
+	var watcher *fsnotify.Watcher
+	baseName := filepath.Base(jsonLogFilePath)
+	dir := filepath.Dir(jsonLogFilePath)
+	retryTimes := 2
+	backBytes := 0
+
+	for {
+		select {
+		case <-stopChannel:
+			log.L.Debug("received stop signal while re-reading JSON logfile, returning")
+			return nil
+		default:
+			if stop || (limitedMode && limitedNum == 0) {
+				log.L.Debugf("finished parsing log JSON filefile, path: %s", jsonLogFilePath)
 				return nil
-			default:
-				// Re-open the file and seek to the last-consumed offset.
-				fin, err = os.OpenFile(jsonLogFilePath, os.O_RDONLY, 0400)
-				if err != nil {
-					fin.Close()
-					return fmt.Errorf("error occurred while trying to re-open JSON logfile %q: %s", jsonLogFilePath, err)
+			}
+
+			if line, err := jsonfile.Decode(stdout, stderr, fin, lvopts.Timestamps, lvopts.Since, lvopts.Until); err != nil {
+				if len(line) > 0 {
+					time.Sleep(5 * time.Millisecond)
+					if retryTimes == 0 {
+						log.L.Infof("finished parsing log JSON filefile, path: %s, line: %s", jsonLogFilePath, string(line))
+						return fmt.Errorf("error occurred while doing read of JSON logfile %q: %s, retryTimes: %d", jsonLogFilePath, err, retryTimes)
+					}
+					retryTimes--
+					backBytes = len(line)
+				} else {
+					return fmt.Errorf("error occurred while doing read of JSON logfile %q: %s", jsonLogFilePath, err)
 				}
-				_, err = fin.Seek(lastPos, 0)
+			} else {
+				retryTimes = 2
+				backBytes = 0
+			}
+
+			if lvopts.Follow {
+				// Get the current file handler's seek.
+				lastPos, err := fin.Seek(int64(-backBytes), io.SeekCurrent)
 				if err != nil {
-					fin.Close()
 					return fmt.Errorf("error occurred while trying to seek JSON logfile %q at position %d: %s", jsonLogFilePath, lastPos, err)
 				}
 
-				err = jsonfile.Decode(stdout, stderr, fin, lvopts.Timestamps, lvopts.Since, lvopts.Until, 0)
-				if err != nil {
-					fin.Close()
-					return fmt.Errorf("error occurred while doing follow-up decoding of JSON logfile %q at starting position %d: %s", jsonLogFilePath, lastPos, err)
+				if watcher == nil {
+					// Initialize the watcher if it has not been initialized yet.
+					if watcher, err = NewLogFileWatcher(dir); err != nil {
+						return err
+					}
+					defer watcher.Close()
+					// If we just created the watcher, try again to read as we might have missed
+					// the event.
+					continue
 				}
 
-				// Record current file seek position before looping again.
-				lastPos, err = fin.Seek(0, io.SeekCurrent)
+				var recreated bool
+				// Wait until the next log change.
+				recreated, err = startTail(context.Background(), baseName, watcher)
 				if err != nil {
-					fin.Close()
-					return fmt.Errorf("error occurred while trying to seek JSON logfile %q at current position: %s", jsonLogFilePath, err)
+					return err
 				}
-				fin.Close()
+				if recreated {
+					newF, err := openFileShareDelete(jsonLogFilePath)
+					if err != nil {
+						if errors.Is(err, os.ErrNotExist) {
+							//If the user application outputs logs too quickly,
+							//There is a slight possibility that nerdctl has just rotated the log file,
+							//try opening it once more.
+							time.Sleep(10 * time.Millisecond)
+						}
+						newF, err = openFileShareDelete(jsonLogFilePath)
+						if err != nil {
+							return fmt.Errorf("failed to open JSON logfile %q: %w", jsonLogFilePath, err)
+						}
+					}
+					fin.Close()
+					fin = newF
+				}
+				continue
 			}
+			stop = true
 			// Give the OS a second to breathe before re-opening the file:
-			time.Sleep(time.Second)
 		}
 	}
-	return nil
-}
-
-// Loads logs through the `tail` executable.
-func viewLogsJSONFileThroughTailExec(lvopts LogViewOptions, jsonLogFilePath string, stdout, stderr io.Writer, stopChannel chan os.Signal) error {
-	var args []string
-
-	args = append(args, "-n")
-	if lvopts.Tail == 0 {
-		args = append(args, "+0")
-	} else {
-		args = append(args, fmt.Sprintf("%d", lvopts.Tail))
-	}
-
-	if lvopts.Follow {
-		args = append(args, "-f")
-	}
-	args = append(args, jsonLogFilePath)
-	cmd := exec.Command("tail", args...)
-	cmd.Stderr = os.Stderr
-	r, err := cmd.StdoutPipe()
-	if err != nil {
-		return err
-	}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-
-	// Setup killing goroutine:
-	go func() {
-		<-stopChannel
-		logrus.Debugf("killing tail logs process with PID: %d", cmd.Process.Pid)
-		cmd.Process.Kill()
-	}()
-
-	return jsonfile.Decode(stdout, stderr, r, lvopts.Timestamps, lvopts.Since, lvopts.Until, 0)
 }

@@ -20,9 +20,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/labels"
-	"github.com/sirupsen/logrus"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/labels"
 )
 
 func (c *Composer) Containers(ctx context.Context, services ...string) ([]containerd.Container, error) {
@@ -34,7 +35,7 @@ func (c *Composer) Containers(ctx context.Context, services ...string) ([]contai
 	if len(services) == 0 {
 		filters = append(filters, projectLabel)
 	}
-	logrus.Debugf("filters: %v", filters)
+	log.G(ctx).Debugf("filters: %v", filters)
 	containers, err := c.client.Containers(ctx, filters...)
 	if err != nil {
 		return nil, err
@@ -61,4 +62,25 @@ func (c *Composer) containerExists(ctx context.Context, name, service string) (b
 	}
 	// container doesn't exist
 	return false, nil
+}
+
+func (c *Composer) containerID(ctx context.Context, name, service string) (string, error) {
+	// get list of containers for service
+	containers, err := c.Containers(ctx, service)
+	if err != nil {
+		return "", err
+	}
+
+	for _, container := range containers {
+		containerLabels, err := container.Labels(ctx)
+		if err != nil {
+			return "", err
+		}
+		if name == containerLabels[labels.Name] {
+			// container exists
+			return container.ID(), nil
+		}
+	}
+	// container doesn't exist
+	return "", nil
 }

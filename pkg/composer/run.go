@@ -22,12 +22,14 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/compose-spec/compose-go/loader"
-	"github.com/compose-spec/compose-go/types"
-	"github.com/containerd/nerdctl/pkg/composer/serviceparser"
-	"github.com/containerd/nerdctl/pkg/idgen"
-	"github.com/sirupsen/logrus"
+	"github.com/compose-spec/compose-go/v2/format"
+	"github.com/compose-spec/compose-go/v2/types"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/composer/serviceparser"
+	"github.com/containerd/nerdctl/v2/pkg/idgen"
 )
 
 type RunOptions struct {
@@ -45,6 +47,7 @@ type RunOptions struct {
 	Detach       bool
 	NoDeps       bool
 	Tty          bool
+	SigProxy     bool
 	Interactive  bool
 	Rm           bool
 	User         string
@@ -93,8 +96,8 @@ func (c *Composer) Run(ctx context.Context, ro RunOptions) error {
 		}
 		svcs = append(svcs, svc)
 	} else {
-		if err := c.project.WithServices([]string{ro.ServiceName}, func(svc types.ServiceConfig) error {
-			svcs = append(svcs, svc)
+		if err := c.project.ForEachService([]string{ro.ServiceName}, func(name string, svc *types.ServiceConfig) error {
+			svcs = append(svcs, *svc)
 			return nil
 		}); err != nil {
 			return err
@@ -113,7 +116,8 @@ func (c *Composer) Run(ctx context.Context, ro RunOptions) error {
 	}
 
 	for i := range svcs {
-		svcs[i].ContainerName = fmt.Sprintf("%s_%s_run_%s", c.project.Name, svcs[i].Name, idgen.TruncateID(idgen.GenerateID()))
+		// FYI: https://github.com/docker/compose/blob/v2.18.1/pkg/compose/run.go#L65
+		svcs[i].ContainerName = fmt.Sprintf("%[1]s%[4]s%[2]s%[4]srun%[4]s%[3]s", c.project.Name, svcs[i].Name, idgen.TruncateID(idgen.GenerateID()), serviceparser.Separator)
 	}
 
 	targetSvc.Tty = ro.Tty
@@ -125,24 +129,24 @@ func (c *Composer) Run(ctx context.Context, ro RunOptions) error {
 	if ro.User != "" {
 		targetSvc.User = ro.User
 	}
-	if ro.Volume != nil && len(ro.Volume) > 0 {
+	if len(ro.Volume) > 0 {
 		for _, v := range ro.Volume {
-			vc, err := loader.ParseVolume(v)
+			vc, err := format.ParseVolume(v)
 			if err != nil {
 				return err
 			}
 			targetSvc.Volumes = append(targetSvc.Volumes, vc)
 		}
 	}
-	if ro.Entrypoint != nil && len(ro.Entrypoint) > 0 {
+	if len(ro.Entrypoint) > 0 {
 		targetSvc.Entrypoint = make([]string, len(ro.Entrypoint))
 		copy(targetSvc.Entrypoint, ro.Entrypoint)
 	}
-	if ro.Env != nil && len(ro.Env) > 0 {
+	if len(ro.Env) > 0 {
 		envs := types.NewMappingWithEquals(ro.Env)
 		targetSvc.Environment.OverrideBy(envs)
 	}
-	if ro.Label != nil && len(ro.Label) > 0 {
+	if len(ro.Label) > 0 {
 		label := types.NewMappingWithEquals(ro.Label)
 		for k, v := range label {
 			if v != nil {
@@ -159,7 +163,7 @@ func (c *Composer) Run(ctx context.Context, ro RunOptions) error {
 		for k := range svcs {
 			svcs[k].Ports = []types.ServicePortConfig{}
 		}
-		if ro.Publish != nil && len(ro.Publish) > 0 {
+		if len(ro.Publish) > 0 {
 			for _, p := range ro.Publish {
 				pc, err := types.ParsePortConfig(p)
 				if err != nil {
@@ -197,15 +201,11 @@ func (c *Composer) Run(ctx context.Context, ro RunOptions) error {
 				return fmt.Errorf("error removing orphaned containers: %s", err)
 			}
 		} else {
-			logrus.Warnf("found %d orphaned containers: %v, you can run this command with the --remove-orphans flag to clean it up", len(orphans), orphans)
+			log.G(ctx).Warnf("found %d orphaned containers: %v, you can run this command with the --remove-orphans flag to clean it up", len(orphans), orphans)
 		}
 	}
 
-	if err := c.runServices(ctx, parsedServices, ro); err != nil {
-		return err
-	}
-
-	return nil
+	return c.runServices(ctx, parsedServices, ro)
 }
 
 func (c *Composer) runServices(ctx context.Context, parsedServices []*serviceparser.Service, ro RunOptions) error {
@@ -215,7 +215,7 @@ func (c *Composer) runServices(ctx context.Context, parsedServices []*servicepar
 
 	// TODO: parallelize loop for ensuring images (make sure not to mess up tty)
 	for _, ps := range parsedServices {
-		if err := c.ensureServiceImage(ctx, ps, !ro.NoBuild, ro.ForceBuild, BuildOptions{}, ro.QuietPull); err != nil {
+		if err := c.ensureServiceImage(ctx, ps, !ro.NoBuild, ro.ForceBuild, BuildOptions{}, ro.QuietPull, ""); err != nil {
 			return err
 		}
 	}
@@ -233,7 +233,7 @@ func (c *Composer) runServices(ctx context.Context, parsedServices []*servicepar
 		services = append(services, ps.Unparsed.Name)
 
 		if len(ps.Containers) != 1 {
-			logrus.Warnf("compose run does not support scale but %s is currently %v, automatically it will configure 1", ps.Unparsed.Name, len(ps.Containers))
+			log.G(ctx).Warnf("compose run does not support scale but %s is currently %v, automatically it will configure 1", ps.Unparsed.Name, len(ps.Containers))
 		}
 
 		if len(ps.Containers) == 0 {
@@ -242,7 +242,7 @@ func (c *Composer) runServices(ctx context.Context, parsedServices []*servicepar
 		container := ps.Containers[0]
 
 		runEG.Go(func() error {
-			id, err := c.upServiceContainer(ctx, ps, container)
+			id, err := c.upServiceContainer(ctx, ps, container, RecreateForce)
 			if err != nil {
 				return err
 			}
@@ -260,14 +260,14 @@ func (c *Composer) runServices(ctx context.Context, parsedServices []*servicepar
 	}
 
 	if ro.Detach {
-		logrus.Printf("%s\n", cid)
+		log.G(ctx).Printf("%s\n", cid)
 		return nil
 	}
 
 	// TODO: fix it when `nerdctl logs` supports `nerdctl run` without detach
 	// https://github.com/containerd/nerdctl/blob/v0.22.2/pkg/taskutil/taskutil.go#L55
 	if !ro.Interactive && !ro.Tty {
-		logrus.Info("Attaching to logs")
+		log.G(ctx).Info("Attaching to logs")
 		lo := LogsOptions{
 			Follow:      true,
 			NoColor:     ro.NoColor,
@@ -279,7 +279,7 @@ func (c *Composer) runServices(ctx context.Context, parsedServices []*servicepar
 		}
 	}
 
-	logrus.Infof("Stopping containers (forcibly)") // TODO: support gracefully stopping
+	log.G(ctx).Infof("Stopping containers (forcibly)") // TODO: support gracefully stopping
 	c.stopContainersFromParsedServices(ctx, containers)
 
 	if ro.Rm {

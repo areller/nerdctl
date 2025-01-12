@@ -20,10 +20,11 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/nerdctl/pkg/api/types"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
 )
 
 func Remove(ctx context.Context, client *containerd.Client, deletedNamespaces []string, options types.NamespaceRemoveOptions) error {
@@ -43,7 +44,7 @@ func Remove(ctx context.Context, client *containerd.Client, deletedNamespaces []
 				continue
 			}
 		}
-		_, err := fmt.Fprintf(options.Stdout, "%s\n", target)
+		_, err := fmt.Fprintln(options.Stdout, target)
 		return err
 	}
 	return exitErr

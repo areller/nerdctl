@@ -21,9 +21,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/ipfs"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/ipfs"
 )
 
 func RegistryServe(options types.IPFSRegistryServeOptions) error {
@@ -47,7 +48,7 @@ func RegistryServe(options types.IPFSRegistryServeOptions) error {
 	if err != nil {
 		return err
 	}
-	logrus.Infof("serving on %v", options.ListenRegistry)
+	log.L.Infof("serving on %v", options.ListenRegistry)
 	http.Handle("/", h)
 	return http.ListenAndServe(options.ListenRegistry, nil)
 }

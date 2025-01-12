@@ -25,26 +25,28 @@ import (
 	"os"
 	"strings"
 
+	"github.com/klauspost/compress/zstd"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
 	overlaybdconvert "github.com/containerd/accelerated-container-image/pkg/convertor"
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/images/converter"
-	"github.com/containerd/containerd/images/converter/uncompress"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/clientutil"
-	converterutil "github.com/containerd/nerdctl/pkg/imgutil/converter"
-	"github.com/containerd/nerdctl/pkg/platformutil"
-	"github.com/containerd/nerdctl/pkg/referenceutil"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/converter"
+	"github.com/containerd/containerd/v2/core/images/converter/uncompress"
+	"github.com/containerd/log"
 	nydusconvert "github.com/containerd/nydus-snapshotter/pkg/converter"
 	"github.com/containerd/stargz-snapshotter/estargz"
 	estargzconvert "github.com/containerd/stargz-snapshotter/nativeconverter/estargz"
 	estargzexternaltocconvert "github.com/containerd/stargz-snapshotter/nativeconverter/estargz/externaltoc"
 	zstdchunkedconvert "github.com/containerd/stargz-snapshotter/nativeconverter/zstdchunked"
 	"github.com/containerd/stargz-snapshotter/recorder"
-	"github.com/klauspost/compress/zstd"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/sirupsen/logrus"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/clientutil"
+	converterutil "github.com/containerd/nerdctl/v2/pkg/imgutil/converter"
+	"github.com/containerd/nerdctl/v2/pkg/platformutil"
+	"github.com/containerd/nerdctl/v2/pkg/referenceutil"
 )
 
 func Convert(ctx context.Context, client *containerd.Client, srcRawRef, targetRawRef string, options types.ImageConvertOptions) error {
@@ -55,17 +57,17 @@ func Convert(ctx context.Context, client *containerd.Client, srcRawRef, targetRa
 		return errors.New("src and target image need to be specified")
 	}
 
-	srcNamed, err := referenceutil.ParseAny(srcRawRef)
+	parsedReference, err := referenceutil.Parse(srcRawRef)
 	if err != nil {
 		return err
 	}
-	srcRef := srcNamed.String()
+	srcRef := parsedReference.String()
 
-	targetNamed, err := referenceutil.ParseDockerRef(targetRawRef)
+	parsedReference, err = referenceutil.Parse(targetRawRef)
 	if err != nil {
 		return err
 	}
-	targetRef := targetNamed.String()
+	targetRef := parsedReference.String()
 
 	platMC, err := platformutil.NewMatchComparer(options.AllPlatforms, options.Platforms)
 	if err != nil {
@@ -73,14 +75,24 @@ func Convert(ctx context.Context, client *containerd.Client, srcRawRef, targetRa
 	}
 	convertOpts = append(convertOpts, converter.WithPlatform(platMC))
 
+	// Ensure all the layers are here: https://github.com/containerd/nerdctl/issues/3425
+	err = EnsureAllContent(ctx, client, srcRef, options.GOptions)
+	if err != nil {
+		return err
+	}
+
 	estargz := options.Estargz
+	zstd := options.Zstd
 	zstdchunked := options.ZstdChunked
 	overlaybd := options.Overlaybd
 	nydus := options.Nydus
 	var finalize func(ctx context.Context, cs content.Store, ref string, desc *ocispec.Descriptor) (*images.Image, error)
-	if estargz || zstdchunked || overlaybd || nydus {
+	if estargz || zstd || zstdchunked || overlaybd || nydus {
 		convertCount := 0
 		if estargz {
+			convertCount++
+		}
+		if zstd {
 			convertCount++
 		}
 		if zstdchunked {
@@ -106,6 +118,12 @@ func Convert(ctx context.Context, client *containerd.Client, srcRawRef, targetRa
 				return err
 			}
 			convertType = "estargz"
+		case zstd:
+			convertFunc, err = getZstdConverter(options)
+			if err != nil {
+				return err
+			}
+			convertType = "zstd"
 		case zstdchunked:
 			convertFunc, err = getZstdchunkedConverter(options)
 			if err != nil {
@@ -134,6 +152,7 @@ func Convert(ctx context.Context, client *containerd.Client, srcRawRef, targetRa
 					FsVersion:        nydusOpts.FsVersion,
 					ChunkDictPath:    nydusOpts.ChunkDictPath,
 					PrefetchPatterns: nydusOpts.PrefetchPatterns,
+					OCI:              true,
 				}),
 			}
 			convertOpts = append(convertOpts, converter.WithIndexConvertFunc(
@@ -152,9 +171,9 @@ func Convert(ctx context.Context, client *containerd.Client, srcRawRef, targetRa
 		}
 		if !options.Oci {
 			if nydus || overlaybd {
-				logrus.Warnf("option --%s should be used in conjunction with --oci, forcibly enabling on oci mediatype for %s conversion", convertType, convertType)
+				log.G(ctx).Warnf("option --%s should be used in conjunction with --oci, forcibly enabling on oci mediatype for %s conversion", convertType, convertType)
 			} else {
-				logrus.Warnf("option --%s should be used in conjunction with --oci", convertType)
+				log.G(ctx).Warnf("option --%s should be used in conjunction with --oci", convertType)
 			}
 		}
 		if options.Uncompress {
@@ -243,7 +262,7 @@ func getESGZConvertOpts(options types.ImageConvertOptions) ([]estargz.Option, er
 			return nil, fmt.Errorf("estargz-record-in requires experimental mode to be enabled")
 		}
 
-		logrus.Warn("--estargz-record-in flag is experimental and subject to change")
+		log.L.Warn("--estargz-record-in flag is experimental and subject to change")
 		paths, err := readPathsFromRecordFile(options.EstargzRecordIn)
 		if err != nil {
 			return nil, err
@@ -253,6 +272,10 @@ func getESGZConvertOpts(options types.ImageConvertOptions) ([]estargz.Option, er
 		esgzOpts = append(esgzOpts, estargz.WithAllowPrioritizeNotFound(&ignored))
 	}
 	return esgzOpts, nil
+}
+
+func getZstdConverter(options types.ImageConvertOptions) (converter.ConvertFunc, error) {
+	return converterutil.ZstdLayerConvertFunc(options)
 }
 
 func getZstdchunkedConverter(options types.ImageConvertOptions) (converter.ConvertFunc, error) {
@@ -266,7 +289,7 @@ func getZstdchunkedConverter(options types.ImageConvertOptions) (converter.Conve
 			return nil, fmt.Errorf("zstdchunked-record-in requires experimental mode to be enabled")
 		}
 
-		logrus.Warn("--zstdchunked-record-in flag is experimental and subject to change")
+		log.L.Warn("--zstdchunked-record-in flag is experimental and subject to change")
 		paths, err := readPathsFromRecordFile(options.ZstdChunkedRecordIn)
 		if err != nil {
 			return nil, err
@@ -341,14 +364,14 @@ func printConvertedImage(stdout io.Writer, options types.ImageConvertOptions, im
 		for i, e := range img.ExtraImages {
 			elems := strings.SplitN(e, "@", 2)
 			if len(elems) < 2 {
-				logrus.Errorf("extra reference %q doesn't contain digest", e)
+				log.L.Errorf("extra reference %q doesn't contain digest", e)
 			} else {
-				logrus.Infof("Extra image(%d) %s", i, elems[0])
+				log.L.Infof("Extra image(%d) %s", i, elems[0])
 			}
 		}
 		elems := strings.SplitN(img.Image, "@", 2)
 		if len(elems) < 2 {
-			logrus.Errorf("reference %q doesn't contain digest", img.Image)
+			log.L.Errorf("reference %q doesn't contain digest", img.Image)
 		} else {
 			fmt.Fprintln(stdout, elems[1])
 		}

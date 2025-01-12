@@ -18,18 +18,28 @@ package container
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 	"syscall"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
 	"github.com/moby/sys/signal"
-	"github.com/sirupsen/logrus"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/go-cni"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/idutil/containerwalker"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
+	"github.com/containerd/nerdctl/v2/pkg/netutil"
+	"github.com/containerd/nerdctl/v2/pkg/netutil/nettype"
+	"github.com/containerd/nerdctl/v2/pkg/portutil"
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
 )
 
 // Kill kills a list of containers
@@ -49,6 +59,9 @@ func Kill(ctx context.Context, client *containerd.Client, reqs []string, options
 			if found.MatchCount > 1 {
 				return fmt.Errorf("multiple IDs found with provided prefix: %s", found.Req)
 			}
+			if err := cleanupNetwork(ctx, found.Container, options.GOptions); err != nil {
+				return fmt.Errorf("unable to cleanup network for container: %s, %q", found.Req, err)
+			}
 			if err := killContainer(ctx, found.Container, parsedSignal); err != nil {
 				if errdefs.IsNotFound(err) {
 					fmt.Fprintf(options.Stderr, "No such container: %s\n", found.Req)
@@ -56,7 +69,7 @@ func Kill(ctx context.Context, client *containerd.Client, reqs []string, options
 				}
 				return err
 			}
-			_, err := fmt.Fprintf(options.Stdout, "%s\n", found.Container.ID())
+			_, err := fmt.Fprintln(options.Stdout, found.Container.ID())
 			return err
 		},
 	}
@@ -64,7 +77,15 @@ func Kill(ctx context.Context, client *containerd.Client, reqs []string, options
 	return walker.WalkAll(ctx, reqs, true)
 }
 
-func killContainer(ctx context.Context, container containerd.Container, signal syscall.Signal) error {
+func killContainer(ctx context.Context, container containerd.Container, signal syscall.Signal) (err error) {
+	defer func() {
+		if err != nil {
+			containerutil.UpdateErrorLabel(ctx, container, err)
+		}
+	}()
+	if err := containerutil.UpdateExplicitlyStoppedLabel(ctx, container, true); err != nil {
+		return err
+	}
 	task, err := container.Task(ctx, cio.Load)
 	if err != nil {
 		return err
@@ -92,8 +113,78 @@ func killContainer(ctx context.Context, container containerd.Container, signal s
 	// signal will be sent once resume is finished
 	if paused {
 		if err := task.Resume(ctx); err != nil {
-			logrus.Warnf("cannot unpause container %s: %s", container.ID(), err)
+			log.G(ctx).Warnf("cannot unpause container %s: %s", container.ID(), err)
 		}
 	}
 	return nil
+}
+
+// cleanupNetwork removes cni network setup, specifically the forwards
+func cleanupNetwork(ctx context.Context, container containerd.Container, globalOpts types.GlobalCommandOptions) error {
+	return rootlessutil.WithDetachedNetNSIfAny(func() error {
+		// retrieve info to get current active port mappings
+		info, err := container.Info(ctx, containerd.WithoutRefreshedMetadata)
+		if err != nil {
+			return err
+		}
+		ports, portErr := portutil.ParsePortsLabel(info.Labels)
+		if portErr != nil {
+			return fmt.Errorf("no oci spec: %q", portErr)
+		}
+		portMappings := []cni.NamespaceOpts{
+			cni.WithCapabilityPortMap(ports),
+		}
+
+		// retrieve info to get cni instance
+		spec, err := container.Spec(ctx)
+		if err != nil {
+			return err
+		}
+		networksJSON := spec.Annotations[labels.Networks]
+		var networks []string
+		if err := json.Unmarshal([]byte(networksJSON), &networks); err != nil {
+			return err
+		}
+		netType, err := nettype.Detect(networks)
+		if err != nil {
+			return err
+		}
+
+		switch netType {
+		case nettype.Host, nettype.None, nettype.Container, nettype.Namespace:
+			// NOP
+		case nettype.CNI:
+			e, err := netutil.NewCNIEnv(globalOpts.CNIPath, globalOpts.CNINetConfPath, netutil.WithNamespace(globalOpts.Namespace), netutil.WithDefaultNetwork(globalOpts.BridgeIP))
+			if err != nil {
+				return err
+			}
+			cniOpts := []cni.Opt{
+				cni.WithPluginDir([]string{globalOpts.CNIPath}),
+			}
+			var netw *netutil.NetworkConfig
+			for _, netstr := range networks {
+				if netw, err = e.NetworkByNameOrID(netstr); err != nil {
+					return err
+				}
+				cniOpts = append(cniOpts, cni.WithConfListBytes(netw.Bytes))
+			}
+			cniObj, err := cni.New(cniOpts...)
+			if err != nil {
+				return err
+			}
+
+			var namespaceOpts []cni.NamespaceOpts
+			namespaceOpts = append(namespaceOpts, portMappings...)
+			namespace := spec.Annotations[labels.Namespace]
+			fullID := namespace + "-" + container.ID()
+			if err := cniObj.Remove(ctx, fullID, "", namespaceOpts...); err != nil {
+				log.L.WithError(err).Errorf("failed to call cni.Remove")
+				return err
+			}
+			return nil
+		default:
+			return fmt.Errorf("unexpected network type %v", netType)
+		}
+		return nil
+	})
 }

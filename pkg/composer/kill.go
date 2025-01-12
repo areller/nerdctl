@@ -19,8 +19,9 @@ package composer
 import (
 	"context"
 
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/containerd/log"
 )
 
 type KillOptions struct {
@@ -42,7 +43,7 @@ func (c *Composer) Kill(ctx context.Context, opts KillOptions, services []string
 		eg.Go(func() error {
 			args := []string{"kill", "-s", opts.Signal, container.ID()}
 			if err := c.runNerdctlCmd(ctx, args...); err != nil {
-				logrus.Warn(err)
+				log.G(ctx).Warn(err)
 				return err
 			}
 			return nil

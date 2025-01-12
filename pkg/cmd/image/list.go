@@ -19,29 +19,37 @@ package image
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"text/template"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/pkg/progress"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/snapshots"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/formatter"
-	"github.com/containerd/nerdctl/pkg/imgutil"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/sirupsen/logrus"
+	"github.com/docker/go-units"
+	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/identity"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/containerdutil"
+	"github.com/containerd/nerdctl/v2/pkg/formatter"
+	"github.com/containerd/nerdctl/v2/pkg/imgutil"
+	"github.com/containerd/nerdctl/v2/pkg/referenceutil"
 )
 
 // ListCommandHandler `List` and print images matching filters in `options`.
-func ListCommandHandler(ctx context.Context, client *containerd.Client, options types.ImageListOptions) error {
+func ListCommandHandler(ctx context.Context, client *containerd.Client, options *types.ImageListOptions) error {
 	imageList, err := List(ctx, client, options.Filters, options.NameAndRefFilter)
 	if err != nil {
 		return err
@@ -74,37 +82,34 @@ func List(ctx context.Context, client *containerd.Client, filters, nameAndRefFil
 			return nil, err
 		}
 
-		if f.Dangling != nil {
-			imageList = imgutil.FilterDangling(imageList, *f.Dangling)
+		filters := []imgutil.Filter{}
+		if f.Dangling != nil && *f.Dangling {
+			filters = append(filters, imgutil.FilterDanglingImages())
+		} else if f.Dangling != nil {
+			filters = append(filters, imgutil.FilterTaggedImages())
 		}
 
-		imageList, err = imgutil.FilterByLabel(ctx, client, imageList, f.Labels)
+		if len(f.Labels) > 0 {
+			filters = append(filters, imgutil.FilterByLabel(ctx, client, f.Labels))
+		}
+
+		if len(f.Reference) > 0 {
+			filters = append(filters, imgutil.FilterByReference(f.Reference))
+		}
+
+		if len(f.Before) > 0 || len(f.Since) > 0 {
+			filters = append(filters, imgutil.FilterByCreatedAt(ctx, client, f.Before, f.Since))
+		}
+
+		imageList, err = imgutil.ApplyFilters(imageList, filters...)
 		if err != nil {
-			return nil, err
+			return []images.Image{}, err
 		}
-
-		imageList, err = imgutil.FilterByReference(imageList, f.Reference)
-		if err != nil {
-			return nil, err
-		}
-
-		var beforeImages []images.Image
-		if len(f.Before) > 0 {
-			beforeImages, err = imageStore.List(ctx, f.Before...)
-			if err != nil {
-				return nil, err
-			}
-		}
-		var sinceImages []images.Image
-		if len(f.Since) > 0 {
-			sinceImages, err = imageStore.List(ctx, f.Since...)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		imageList = imgutil.FilterImages(imageList, beforeImages, sinceImages)
 	}
+
+	sort.Slice(imageList, func(i, j int) bool {
+		return imageList[i].CreatedAt.After(imageList[j].CreatedAt)
+	})
 	return imageList, nil
 }
 
@@ -119,12 +124,52 @@ type imagePrintable struct {
 	Name         string // image name
 	Size         string // the size of the unpacked snapshots.
 	BlobSize     string // the size of the blobs in the content store (nerdctl extension)
-	// TODO: "SharedSize", "UniqueSize", "VirtualSize"
+	// TODO: "SharedSize", "UniqueSize"
 	Platform string // nerdctl extension
 }
 
-func printImages(ctx context.Context, client *containerd.Client, imageList []images.Image, options types.ImageListOptions) error {
+func printImages(ctx context.Context, client *containerd.Client, imageList []images.Image, options *types.ImageListOptions) error {
 	w := options.Stdout
+	var finalImageList []images.Image
+	/*
+		the same imageId under k8s.io is showing multiple results: repo:tag, repo:digest, configID.
+		We expect to display only repo:tag, consistent with other namespaces and CRI
+		e.g.
+		nerdctl -n k8s.io images
+		REPOSITORY    TAG       IMAGE ID        CREATED        PLATFORM       SIZE         BLOB SIZE
+		centos        7         be65f488b776    3 hours ago    linux/amd64    211.5 MiB    72.6 MiB
+		centos        <none>    be65f488b776    3 hours ago    linux/amd64    211.5 MiB    72.6 MiB
+		<none>        <none>    be65f488b776    3 hours ago    linux/amd64    211.5 MiB    72.6 MiB
+		expect:
+		nerdctl --kube-hide-dupe -n k8s.io images
+		REPOSITORY    TAG       IMAGE ID        CREATED        PLATFORM       SIZE         BLOB SIZE
+		centos        7         be65f488b776    3 hours ago    linux/amd64    211.5 MiB    72.6 MiB
+	*/
+	if options.GOptions.KubeHideDupe && options.GOptions.Namespace == "k8s.io" {
+		imageDigest := make(map[digest.Digest]bool)
+		var imageNoTag []images.Image
+		for _, img := range imageList {
+			parsed, err := referenceutil.Parse(img.Name)
+			if err != nil {
+				continue
+			}
+			if parsed.Tag != "" {
+				finalImageList = append(finalImageList, img)
+				imageDigest[img.Target.Digest] = true
+				continue
+			}
+			imageNoTag = append(imageNoTag, img)
+		}
+		//Ensure that dangling images without a repo:tag are displayed correctly.
+		for _, ima := range imageNoTag {
+			if !imageDigest[ima.Target.Digest] {
+				finalImageList = append(finalImageList, ima)
+				imageDigest[ima.Target.Digest] = true
+			}
+		}
+	} else {
+		finalImageList = imageList
+	}
 	digestsFlag := options.Digests
 	if options.Format == "wide" {
 		digestsFlag = true
@@ -160,20 +205,20 @@ func printImages(ctx context.Context, client *containerd.Client, imageList []ima
 	}
 
 	printer := &imagePrinter{
-		w:            w,
-		quiet:        options.Quiet,
-		noTrunc:      options.Quiet,
-		digestsFlag:  digestsFlag,
-		namesFlag:    options.Names,
-		tmpl:         tmpl,
-		client:       client,
-		contentStore: client.ContentStore(),
-		snapshotter:  client.SnapshotService(options.GOptions.Snapshotter),
+		w:           w,
+		quiet:       options.Quiet,
+		noTrunc:     options.NoTrunc,
+		digestsFlag: digestsFlag,
+		namesFlag:   options.Names,
+		tmpl:        tmpl,
+		client:      client,
+		provider:    containerdutil.NewProvider(client),
+		snapshotter: containerdutil.SnapshotService(client, options.GOptions.Snapshotter),
 	}
 
-	for _, img := range imageList {
+	for _, img := range finalImageList {
 		if err := printer.printImage(ctx, img); err != nil {
-			logrus.Warn(err)
+			log.G(ctx).Warn(err)
 		}
 	}
 	if f, ok := w.(formatter.Flusher); ok {
@@ -187,36 +232,127 @@ type imagePrinter struct {
 	quiet, noTrunc, digestsFlag, namesFlag bool
 	tmpl                                   *template.Template
 	client                                 *containerd.Client
-	contentStore                           content.Store
+	provider                               content.Provider
 	snapshotter                            snapshots.Snapshotter
 }
 
-func (x *imagePrinter) printImage(ctx context.Context, img images.Image) error {
-	ociPlatforms, err := images.Platforms(ctx, x.contentStore, img.Target)
+type image struct {
+	blobSize int64
+	size     int64
+	platform platforms.Platform
+	config   *ocispec.Descriptor
+}
+
+func readManifest(ctx context.Context, provider content.Provider, snapshotter snapshots.Snapshotter, desc ocispec.Descriptor) (*image, error) {
+	// Read the manifest blob from the descriptor
+	manifestData, err := containerdutil.ReadBlob(ctx, provider, desc)
 	if err != nil {
-		logrus.WithError(err).Warnf("failed to get the platform list of image %q", img.Name)
-		return x.printImageSinglePlatform(ctx, img, platforms.DefaultSpec())
+		return nil, err
 	}
-	for _, ociPlatform := range ociPlatforms {
-		if err := x.printImageSinglePlatform(ctx, img, ociPlatform); err != nil {
-			logrus.WithError(err).Warnf("failed to get platform %q of image %q", platforms.Format(ociPlatform), img.Name)
+
+	// Unmarshal as Manifest
+	var manifest ocispec.Manifest
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		return nil, err
+	}
+
+	// Now, read the config
+	configData, err := containerdutil.ReadBlob(ctx, provider, manifest.Config)
+	if err != nil {
+		return nil, err
+	}
+
+	// Unmarshal as Image
+	var config ocispec.Image
+	if err := json.Unmarshal(configData, &config); err != nil {
+		log.G(ctx).Error("Error unmarshaling config")
+		return nil, err
+	}
+
+	// If we are here, the image exists and is valid, so, do our size lookups
+
+	// Aggregate the descriptor size, and blob size from the config and layers
+	blobSize := desc.Size + manifest.Config.Size
+	for _, layerDescriptor := range manifest.Layers {
+		blobSize += layerDescriptor.Size
+	}
+
+	// Get the platform
+	plt := platforms.Normalize(ocispec.Platform{OS: config.OS, Architecture: config.Architecture, Variant: config.Variant})
+
+	// Get the filesystem size for all layers
+	chainID := identity.ChainID(config.RootFS.DiffIDs).String()
+	size := int64(0)
+	if _, actualSize, err := imgutil.ResourceUsage(ctx, snapshotter, chainID); err == nil {
+		size = actualSize.Size
+	}
+
+	return &image{
+		blobSize: blobSize,
+		size:     size,
+		platform: plt,
+		config:   &manifest.Config,
+	}, nil
+}
+
+func readIndex(ctx context.Context, provider content.Provider, snapshotter snapshots.Snapshotter, desc ocispec.Descriptor) (map[string]*image, error) {
+	descs := map[string]*image{}
+
+	// Read the index
+	indexData, err := containerdutil.ReadBlob(ctx, provider, desc)
+	if err != nil {
+		return nil, err
+	}
+
+	// Unmarshal as Index
+	var index ocispec.Index
+	if err := json.Unmarshal(indexData, &index); err != nil {
+		return nil, err
+	}
+
+	// Iterate over manifest descriptors and read them all
+	for _, manifestDescriptor := range index.Manifests {
+		manifest, err := readManifest(ctx, provider, snapshotter, manifestDescriptor)
+		if err != nil {
+			continue
+		}
+		descs[platforms.FormatAll(manifest.platform)] = manifest
+	}
+	return descs, err
+}
+
+func read(ctx context.Context, provider content.Provider, snapshotter snapshots.Snapshotter, desc ocispec.Descriptor) (map[string]*image, error) {
+	if images.IsManifestType(desc.MediaType) {
+		manifest, err := readManifest(ctx, provider, snapshotter, desc)
+		if err != nil {
+			return nil, err
+		}
+		descs := map[string]*image{}
+		descs[platforms.FormatAll(manifest.platform)] = manifest
+		return descs, nil
+	}
+	if images.IsIndexType(desc.MediaType) {
+		return readIndex(ctx, provider, snapshotter, desc)
+	}
+	return nil, fmt.Errorf("unknown media type: %s", desc.MediaType)
+}
+
+func (x *imagePrinter) printImage(ctx context.Context, img images.Image) error {
+	candidateImages, err := read(ctx, x.provider, x.snapshotter, img.Target)
+	if err != nil {
+		return err
+	}
+
+	for platform, desc := range candidateImages {
+		if err := x.printImageSinglePlatform(*desc.config, img, desc.blobSize, desc.size, desc.platform); err != nil {
+			log.G(ctx).WithError(err).Debugf("failed to get platform %q of image %q", platform, img.Name)
 		}
 	}
+
 	return nil
 }
 
-func (x *imagePrinter) printImageSinglePlatform(ctx context.Context, img images.Image, ociPlatform v1.Platform) error {
-	platMC := platforms.OnlyStrict(ociPlatform)
-	if avail, _, _, _, availErr := images.Check(ctx, x.contentStore, img.Target, platMC); !avail {
-		logrus.WithError(availErr).Debugf("skipping printing image %q for platform %q", img.Name, platforms.Format(ociPlatform))
-		return nil
-	}
-
-	image := containerd.NewImageWithPlatform(x.client, img, platMC)
-	desc, err := image.Config(ctx)
-	if err != nil {
-		logrus.WithError(err).Warnf("failed to get config of image %q for platform %q", img.Name, platforms.Format(ociPlatform))
-	}
+func (x *imagePrinter) printImageSinglePlatform(desc ocispec.Descriptor, img images.Image, blobSize int64, size int64, plt platforms.Platform) error {
 	var (
 		repository string
 		tag        string
@@ -224,16 +360,6 @@ func (x *imagePrinter) printImageSinglePlatform(ctx context.Context, img images.
 	// cri plugin will create an image named digest of image's config, skip parsing.
 	if x.namesFlag || desc.Digest.String() != img.Name {
 		repository, tag = imgutil.ParseRepoTag(img.Name)
-	}
-
-	blobSize, err := image.Size(ctx)
-	if err != nil {
-		logrus.WithError(err).Warnf("failed to get blob size of image %q for platform %q", img.Name, platforms.Format(ociPlatform))
-	}
-
-	size, err := imgutil.UnpackedImageSize(ctx, x.snapshotter, image)
-	if err != nil {
-		logrus.WithError(err).Warnf("failed to get unpacked size of image %q for platform %q", img.Name, platforms.Format(ociPlatform))
 	}
 
 	p := imagePrintable{
@@ -244,9 +370,9 @@ func (x *imagePrinter) printImageSinglePlatform(ctx context.Context, img images.
 		Repository:   repository,
 		Tag:          tag,
 		Name:         img.Name,
-		Size:         progress.Bytes(size).String(),
-		BlobSize:     progress.Bytes(blobSize).String(),
-		Platform:     platforms.Format(ociPlatform),
+		Size:         units.HumanSize(float64(size)),
+		BlobSize:     units.HumanSize(float64(blobSize)),
+		Platform:     platforms.FormatAll(plt),
 	}
 	if p.Repository == "" {
 		p.Repository = "<none>"
@@ -263,11 +389,11 @@ func (x *imagePrinter) printImageSinglePlatform(ctx context.Context, img images.
 		if err := x.tmpl.Execute(&b, p); err != nil {
 			return err
 		}
-		if _, err = fmt.Fprintf(x.w, b.String()+"\n"); err != nil {
+		if _, err := fmt.Fprintln(x.w, b.String()); err != nil {
 			return err
 		}
 	} else if x.quiet {
-		if _, err := fmt.Fprintf(x.w, "%s\n", p.ID); err != nil {
+		if _, err := fmt.Fprintln(x.w, p.ID); err != nil {
 			return err
 		}
 	} else {

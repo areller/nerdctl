@@ -21,18 +21,19 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/compose-spec/compose-go/types"
-	"github.com/containerd/nerdctl/pkg/composer/serviceparser"
+	"github.com/compose-spec/compose-go/v2/types"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/composer/serviceparser"
 )
 
 type PushOptions struct {
 }
 
 func (c *Composer) Push(ctx context.Context, po PushOptions, services []string) error {
-	return c.project.WithServices(services, func(svc types.ServiceConfig) error {
-		ps, err := serviceparser.Parse(c.project, svc)
+	return c.project.ForEachService(services, func(name string, svc *types.ServiceConfig) error {
+		ps, err := serviceparser.Parse(c.project, *svc)
 		if err != nil {
 			return err
 		}
@@ -41,7 +42,7 @@ func (c *Composer) Push(ctx context.Context, po PushOptions, services []string) 
 }
 
 func (c *Composer) pushServiceImage(ctx context.Context, image string, platform string, ps *serviceparser.Service, po PushOptions) error {
-	logrus.Infof("Pushing image %s", image)
+	log.G(ctx).Infof("Pushing image %s", image)
 
 	var args []string // nolint: prealloc
 	if platform != "" {
@@ -61,7 +62,7 @@ func (c *Composer) pushServiceImage(ctx context.Context, image string, platform 
 
 	cmd := c.createNerdctlCmd(ctx, append([]string{"push"}, args...)...)
 	if c.DebugPrintFull {
-		logrus.Debugf("Running %v", cmd.Args)
+		log.G(ctx).Debugf("Running %v", cmd.Args)
 	}
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout

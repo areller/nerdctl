@@ -17,7 +17,9 @@
 package containerutil
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,78 +27,190 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containerd/nerdctl/pkg/rootlessutil"
-	"github.com/containerd/nerdctl/pkg/tarutil"
-	securejoin "github.com/cyphar/filepath-securejoin"
-	"github.com/sirupsen/logrus"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
+	"github.com/containerd/nerdctl/v2/pkg/tarutil"
 )
 
-// CopyFiles implements `nerdctl cp`.
-//
 // See https://docs.docker.com/engine/reference/commandline/cp/ for the specification.
-func CopyFiles(ctx context.Context, container2host bool, pid int, dst, src string, followSymlink bool) error {
+
+var (
+	// Generic and system errors
+	ErrFilesystem             = errors.New("filesystem error") // lstat hard errors, etc
+	ErrContainerVanished      = errors.New("the container you are trying to copy to/from has been deleted")
+	ErrRootlessCannotCp       = errors.New("cannot use cp with stopped containers in rootless mode") // rootless cp with a stopped container
+	ErrFailedMountingSnapshot = errors.New("failed mounting snapshot")                               // failure to mount a stopped container snapshot
+
+	// CP specific errors
+	ErrTargetIsReadOnly           = errors.New("cannot copy into read-only location")                            // ...
+	ErrSourceIsNotADir            = errors.New("source is not a directory")                                      // cp SOMEFILE/ foo:/
+	ErrDestinationIsNotADir       = errors.New("destination is not a directory")                                 // * cp ./ foo:/etc/issue/bah
+	ErrSourceDoesNotExist         = errors.New("source does not exist")                                          // cp NONEXISTENT foo:/
+	ErrDestinationParentMustExist = errors.New("destination parent does not exist")                              // nerdctl cp VALID_PATH foo:/NONEXISTENT/NONEXISTENT
+	ErrDestinationDirMustExist    = errors.New("the destination directory must exist to be able to copy a file") // * cp SOMEFILE foo:/NONEXISTENT/
+	ErrCannotCopyDirToFile        = errors.New("cannot copy a directory to a file")                              // cp SOMEDIR foo:/etc/issue
+)
+
+// getRoot will tentatively return the root of the container on the host (/proc/pid/root), along with the pid,
+// (eg: doable when the container is running)
+func getRoot(ctx context.Context, container containerd.Container) (string, int, error) {
+	task, err := container.Task(ctx, nil)
+	if err != nil {
+		return "", 0, err
+	}
+
+	status, err := task.Status(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+
+	if status.Status != containerd.Running {
+		return "", 0, nil
+	}
+	pid := int(task.Pid())
+
+	return fmt.Sprintf("/proc/%d/root", pid), pid, nil
+}
+
+// CopyFiles implements `nerdctl cp`
+// It currently depends on the following assumptions:
+// - linux only
+// - tar binary exists on the system
+// - nsenter binary exists on the system
+// - if rootless, the container is running (aka: /proc/pid/root)
+func CopyFiles(ctx context.Context, client *containerd.Client, container containerd.Container, options types.ContainerCpOptions) (err error) {
+	// We do rely on the tar binary as a shortcut - could also be replaced by archive/tar, though that would mean
+	// we need to replace nsenter calls with re-exec
 	tarBinary, isGNUTar, err := tarutil.FindTarBinary()
 	if err != nil {
 		return err
 	}
-	logrus.Debugf("Detected tar binary %q (GNU=%v)", tarBinary, isGNUTar)
-	var srcFull, dstFull string
-	root := fmt.Sprintf("/proc/%d/root", pid)
-	if container2host {
-		srcFull, err = securejoin.SecureJoin(root, src)
-		dstFull = dst
-	} else {
-		srcFull = src
-		dstFull, err = securejoin.SecureJoin(root, dst)
-	}
-	if err != nil {
-		return err
-	}
-	var (
-		srcIsDir       bool
-		dstExists      bool
-		dstExistsAsDir bool
-	)
-	st, err := os.Stat(srcFull)
-	if err != nil {
-		return err
-	}
-	srcIsDir = st.IsDir()
 
-	// dst may not exist yet, so err is negligible
-	if st, err := os.Stat(dstFull); err == nil {
-		dstExists = true
-		dstExistsAsDir = st.IsDir()
+	log.G(ctx).Debugf("Detected tar binary %q (GNU=%v)", tarBinary, isGNUTar)
+
+	// This can happen if the container being passed has been deleted since in a racy way
+	conSpec, err := container.Spec(ctx)
+	if err != nil {
+		return errors.Join(ErrContainerVanished, err)
 	}
-	dstEndsWithSep := strings.HasSuffix(dst, string(os.PathSeparator))
-	srcEndsWithSlashDot := strings.HasSuffix(src, string(os.PathSeparator)+".")
-	if !srcIsDir && dstEndsWithSep && !dstExistsAsDir {
-		// The error is specified in https://docs.docker.com/engine/reference/commandline/cp/
-		// See the `DEST_PATH does not exist and ends with /` case.
-		return fmt.Errorf("the destination directory must exists: %w", err)
+
+	// Try to get a running container root
+	root, pid, err := getRoot(ctx, container)
+	// If the task is "not found" (for example, if the container stopped), we will try to mount the snapshot
+	// Any other type of error from Task() is fatal here.
+	if err != nil && !errdefs.IsNotFound(err) {
+		return errors.Join(ErrContainerVanished, err)
 	}
-	if !srcIsDir && srcEndsWithSlashDot {
-		return fmt.Errorf("the source is not a directory")
+
+	log.G(ctx).Debugf("We have root %s and pid %d", root, pid)
+
+	// If we have no root:
+	// - bail out for rootless
+	// - mount the snapshot for rootful
+	if root == "" {
+		// FIXME: Rootless does not support copying into/out of stopped/created containers as we need to nsenter into
+		// the user namespace of the pid of the running container with --preserve-credentials to preserve uid/gid
+		// mapping and copy files into the container.
+		if rootlessutil.IsRootless() {
+			return ErrRootlessCannotCp
+		}
+
+		// See similar situation above. This may happen if we are racing against container deletion
+		var conInfo containers.Container
+		conInfo, err = container.Info(ctx)
+		if err != nil {
+			return errors.Join(ErrContainerVanished, err)
+		}
+
+		var cleanup func() error
+		root, cleanup, err = mountSnapshotForContainer(ctx, client, conInfo, options.GOptions.Snapshotter)
+		if cleanup != nil {
+			defer func() {
+				err = errors.Join(err, cleanup())
+			}()
+		}
+
+		if err != nil {
+			return errors.Join(ErrFailedMountingSnapshot, err)
+		}
+
+		log.G(ctx).Debugf("Got new root %s", root)
 	}
-	if srcIsDir && dstExists && !dstExistsAsDir {
-		return fmt.Errorf("cannot copy a directory to a file")
+
+	var sourceSpec, destinationSpec *pathSpecifier
+	var sourceErr, destErr error
+	if options.Container2Host {
+		sourceSpec, sourceErr = getPathSpecFromContainer(options.SrcPath, conSpec, root)
+		destinationSpec, destErr = getPathSpecFromHost(options.DestPath)
+	} else {
+		sourceSpec, sourceErr = getPathSpecFromHost(options.SrcPath)
+		destinationSpec, destErr = getPathSpecFromContainer(options.DestPath, conSpec, root)
 	}
-	if srcIsDir && !dstExists {
-		if err := os.MkdirAll(dstFull, 0755); err != nil {
-			return err
+
+	if destErr != nil {
+		if errors.Is(destErr, errDoesNotExist) {
+			return ErrDestinationParentMustExist
+		} else if errors.Is(destErr, errIsNotADir) {
+			return ErrDestinationIsNotADir
+		}
+
+		return errors.Join(ErrFilesystem, destErr)
+	}
+
+	if sourceErr != nil {
+		if errors.Is(sourceErr, errDoesNotExist) {
+			return ErrSourceDoesNotExist
+		} else if errors.Is(sourceErr, errIsNotADir) {
+			return ErrSourceIsNotADir
+		}
+
+		return errors.Join(ErrFilesystem, sourceErr)
+	}
+
+	// Now, resolve cp shenanigans
+	// First, cannot copy a non-existent resource
+	if !sourceSpec.exists {
+		return ErrSourceDoesNotExist
+	}
+
+	// Second, cannot copy into a readonly destination
+	if destinationSpec.readOnly {
+		return ErrTargetIsReadOnly
+	}
+
+	// Cannot copy a dir into a file
+	if sourceSpec.isADir && destinationSpec.exists && !destinationSpec.isADir {
+		return ErrCannotCopyDirToFile
+	}
+
+	// A file cannot be copied inside a non-existent directory with a trailing slash, or slash+dot
+	if !sourceSpec.isADir && !destinationSpec.exists && (destinationSpec.endsWithSeparator || destinationSpec.endsWithSeparatorDot) {
+		return ErrDestinationDirMustExist
+	}
+
+	// XXX FIXME: this seems wrong. What about ownership? We could be doing that inside a container
+	if !destinationSpec.exists {
+		if err = os.Mkdir(destinationSpec.resolvedPath, 0o755); err != nil {
+			return errors.Join(ErrFilesystem, err)
 		}
 	}
 
 	var tarCDir, tarCArg string
-	if srcIsDir {
-		if !dstExists || srcEndsWithSlashDot {
+	if sourceSpec.isADir {
+		if !destinationSpec.exists || sourceSpec.endsWithSeparatorDot {
 			// the content of the source directory is copied into this directory
-			tarCDir = srcFull
+			tarCDir = sourceSpec.resolvedPath
 			tarCArg = "."
 		} else {
 			// the source directory is copied into this directory
-			tarCDir = filepath.Dir(srcFull)
-			tarCArg = filepath.Base(srcFull)
+			tarCDir = filepath.Dir(sourceSpec.resolvedPath)
+			tarCArg = filepath.Base(sourceSpec.resolvedPath)
 		}
 	} else {
 		// Prepare a single-file directory to create an archive of the source file
@@ -107,46 +221,50 @@ func CopyFiles(ctx context.Context, container2host bool, pid int, dst, src strin
 		defer os.RemoveAll(td)
 		tarCDir = td
 		cp := []string{"cp", "-a"}
-		if followSymlink {
+		if options.FollowSymLink {
 			cp = append(cp, "-L")
 		}
-		if dstEndsWithSep || dstExistsAsDir {
-			tarCArg = filepath.Base(srcFull)
+		if destinationSpec.endsWithSeparator || (destinationSpec.exists && destinationSpec.isADir) {
+			tarCArg = filepath.Base(sourceSpec.resolvedPath)
 		} else {
 			// Handle `nerdctl cp /path/to/file some-container:/path/to/file-with-another-name`
-			tarCArg = filepath.Base(dstFull)
+			tarCArg = filepath.Base(destinationSpec.resolvedPath)
 		}
-		cp = append(cp, srcFull, filepath.Join(td, tarCArg))
+		cp = append(cp, sourceSpec.resolvedPath, filepath.Join(td, tarCArg))
 		cpCmd := exec.CommandContext(ctx, cp[0], cp[1:]...)
-		logrus.Debugf("executing %v", cpCmd.Args)
+		log.G(ctx).Debugf("executing %v", cpCmd.Args)
 		if out, err := cpCmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("failed to execute %v: %w (out=%q)", cpCmd.Args, err, string(out))
 		}
 	}
 	tarC := []string{tarBinary}
-	if followSymlink {
+	if options.FollowSymLink {
 		tarC = append(tarC, "-h")
 	}
 	tarC = append(tarC, "-c", "-f", "-", tarCArg)
 
-	tarXDir := dstFull
-	if !srcIsDir && !dstEndsWithSep && !dstExistsAsDir {
-		tarXDir = filepath.Dir(dstFull)
+	tarXDir := destinationSpec.resolvedPath
+	if !sourceSpec.isADir && !destinationSpec.endsWithSeparator && !(destinationSpec.exists && destinationSpec.isADir) {
+		tarXDir = filepath.Dir(destinationSpec.resolvedPath)
 	}
 	tarX := []string{tarBinary, "-x"}
-	if container2host && isGNUTar {
+	if options.Container2Host && isGNUTar {
 		tarX = append(tarX, "--no-same-owner")
 	}
 	tarX = append(tarX, "-f", "-")
+
 	if rootlessutil.IsRootless() {
 		nsenter := []string{"nsenter", "-t", strconv.Itoa(pid), "-U", "--preserve-credentials", "--"}
-		if container2host {
+		if options.Container2Host {
 			tarC = append(nsenter, tarC...)
 		} else {
 			tarX = append(nsenter, tarX...)
 		}
 	}
 
+	// FIXME: moving to archive/tar should allow better error management than this
+	// WARNING: some of our testing on stderr might not be portable across different versions of tar
+	// In these cases (readonly target), we will just get the straight tar output instead
 	tarCCmd := exec.CommandContext(ctx, tarC[0], tarC[1:]...)
 	tarCCmd.Dir = tarCDir
 	tarCCmd.Stdin = nil
@@ -159,21 +277,74 @@ func CopyFiles(ctx context.Context, container2host bool, pid int, dst, src strin
 		return err
 	}
 	tarXCmd.Stdout = os.Stderr
-	tarXCmd.Stderr = os.Stderr
+	var tarErr bytes.Buffer
+	tarXCmd.Stderr = &tarErr
 
-	logrus.Debugf("executing %v in %q", tarCCmd.Args, tarCCmd.Dir)
+	log.G(ctx).Debugf("executing %v in %q", tarCCmd.Args, tarCCmd.Dir)
 	if err := tarCCmd.Start(); err != nil {
-		return fmt.Errorf("failed to execute %v: %w", tarCCmd.Args, err)
+		return errors.Join(fmt.Errorf("failed to execute %v", tarCCmd.Args), err)
 	}
-	logrus.Debugf("executing %v in %q", tarXCmd.Args, tarXCmd.Dir)
+
+	log.G(ctx).Debugf("executing %v in %q", tarXCmd.Args, tarXCmd.Dir)
 	if err := tarXCmd.Start(); err != nil {
-		return fmt.Errorf("failed to execute %v: %w", tarXCmd.Args, err)
+		if strings.Contains(err.Error(), "permission denied") {
+			return ErrTargetIsReadOnly
+		}
+
+		// Other errors, just put them back on stderr
+		_, fpErr := fmt.Fprint(os.Stderr, tarErr.String())
+		if fpErr != nil {
+			return errors.Join(fpErr, err)
+		}
+
+		return errors.Join(fmt.Errorf("failed to execute %v", tarXCmd.Args), err)
 	}
+
 	if err := tarCCmd.Wait(); err != nil {
 		return fmt.Errorf("failed to wait %v: %w", tarCCmd.Args, err)
 	}
+
 	if err := tarXCmd.Wait(); err != nil {
-		return fmt.Errorf("failed to wait %v: %w", tarXCmd.Args, err)
+		if strings.Contains(tarErr.String(), "Read-only file system") {
+			return ErrTargetIsReadOnly
+		}
+
+		// Other errors, just put them back on stderr
+		_, fpErr := fmt.Fprint(os.Stderr, tarErr.String())
+		if fpErr != nil {
+			return errors.Join(fpErr, err)
+		}
+
+		return errors.Join(fmt.Errorf("failed to wait %v", tarXCmd.Args), err)
 	}
+
 	return nil
+}
+
+func mountSnapshotForContainer(ctx context.Context, client *containerd.Client, conInfo containers.Container, snapshotter string) (string, func() error, error) {
+	snapKey := conInfo.SnapshotKey
+	resp, err := client.SnapshotService(snapshotter).Mounts(ctx, snapKey)
+	if err != nil {
+		return "", nil, err
+	}
+
+	tempDir, err := os.MkdirTemp("", "nerdctl-cp-")
+	if err != nil {
+		return "", nil, err
+	}
+
+	err = mount.All(resp, tempDir)
+	if err != nil {
+		return "", nil, err
+	}
+
+	cleanup := func() error {
+		err = mount.Unmount(tempDir, 0)
+		if err != nil {
+			return err
+		}
+		return os.RemoveAll(tempDir)
+	}
+
+	return tempDir, cleanup, nil
 }

@@ -20,11 +20,12 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/containerutil"
-	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/errdefs"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/idutil/containerwalker"
 )
 
 // Stop stops a list of containers specified by `reqs`.
@@ -35,6 +36,9 @@ func Stop(ctx context.Context, client *containerd.Client, reqs []string, opt typ
 			if found.MatchCount > 1 {
 				return fmt.Errorf("multiple IDs found with provided prefix: %s", found.Req)
 			}
+			if err := cleanupNetwork(ctx, found.Container, opt.GOptions); err != nil {
+				return fmt.Errorf("unable to cleanup network for container: %s", found.Req)
+			}
 			if err := containerutil.Stop(ctx, found.Container, opt.Timeout); err != nil {
 				if errdefs.IsNotFound(err) {
 					fmt.Fprintf(opt.Stderr, "No such container: %s\n", found.Req)
@@ -42,7 +46,7 @@ func Stop(ctx context.Context, client *containerd.Client, reqs []string, opt typ
 				}
 				return err
 			}
-			_, err := fmt.Fprintf(opt.Stdout, "%s\n", found.Req)
+			_, err := fmt.Fprintln(opt.Stdout, found.Req)
 			return err
 		},
 	}

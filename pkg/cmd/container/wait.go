@@ -18,13 +18,14 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
-	"github.com/hashicorp/go-multierror"
+	containerd "github.com/containerd/containerd/v2/client"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/idutil/containerwalker"
 )
 
 // Wait blocks until all the containers specified by reqs have stopped, then print their exit codes.
@@ -46,14 +47,14 @@ func Wait(ctx context.Context, client *containerd.Client, reqs []string, options
 		return err
 	}
 
-	var allErr error
+	var errs []error
 	w := options.Stdout
 	for _, container := range containers {
 		if waitErr := waitContainer(ctx, w, container); waitErr != nil {
-			allErr = multierror.Append(allErr, waitErr)
+			errs = append(errs, waitErr)
 		}
 	}
-	return allErr
+	return errors.Join(errs...)
 }
 
 func waitContainer(ctx context.Context, w io.Writer, container containerd.Container) error {

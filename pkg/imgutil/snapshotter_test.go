@@ -21,12 +21,15 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/containerd/containerd"
-	ctdsnapshotters "github.com/containerd/containerd/pkg/snapshotters"
-	"github.com/containerd/nerdctl/pkg/imgutil/pull"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"gotest.tools/v3/assert"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	ctdsnapshotters "github.com/containerd/containerd/v2/pkg/snapshotters"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/imgutil/pull"
 )
 
 const (
@@ -51,6 +54,10 @@ func TestGetSnapshotterOpts(t *testing.T) {
 		{
 			sns:   []string{"stargz", "stargz-v1"},
 			check: remoteSnOpts("stargz", true),
+		},
+		{
+			sns:   []string{"soci"},
+			check: remoteSnOpts("soci", true),
 		},
 		{
 			sns:   []string{"overlaybd", "overlaybd-v2"},
@@ -89,7 +96,8 @@ func sameOpts(want snapshotterOpts) func(*testing.T, snapshotterOpts) {
 func getAndApplyRemoteOpts(t *testing.T, sn string) *containerd.RemoteContext {
 	config := &pull.Config{}
 	snOpts := getSnapshotterOpts(sn)
-	snOpts.apply(config, testRef)
+	rFlags := types.RemoteSnapshotterFlags{}
+	snOpts.apply(config, testRef, rFlags)
 
 	rc := &containerd.RemoteContext{}
 	for _, o := range config.RemoteOpts {
@@ -130,6 +138,12 @@ func TestRemoteSnapshotterOpts(t *testing.T) {
 			name: "stargz",
 			check: []func(t *testing.T, a map[string]string){
 				checkRemoteSnapshotterAnnotataions, checkStargzSnapshotterAnnotataions,
+			},
+		},
+		{
+			name: "soci",
+			check: []func(t *testing.T, a map[string]string){
+				checkRemoteSnapshotterAnnotataions, checkSociSnapshotterAnnotataions,
 			},
 		},
 		{
@@ -174,4 +188,17 @@ func checkStargzSnapshotterAnnotataions(t *testing.T, a map[string]string) {
 	assert.Check(t, a != nil)
 	_, ok := a["containerd.io/snapshot/remote/urls"]
 	assert.Equal(t, ok, true)
+}
+
+// using values from soci source to check for annotations (
+// see https://github.com/awslabs/soci-snapshotter/blob/b05ba712d246ecc5146469f87e5e9305702fd72b/fs/source/source.go#L80C1-L80C6
+func checkSociSnapshotterAnnotataions(t *testing.T, a map[string]string) {
+	assert.Check(t, a != nil)
+	_, ok := a["containerd.io/snapshot/remote/soci.size"]
+	assert.Equal(t, ok, true)
+	_, ok = a["containerd.io/snapshot/remote/image.layers.size"]
+	assert.Equal(t, ok, true)
+	_, ok = a["containerd.io/snapshot/remote/soci.index.digest"]
+	assert.Equal(t, ok, true)
+
 }

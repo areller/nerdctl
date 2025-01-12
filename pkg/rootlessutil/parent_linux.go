@@ -26,7 +26,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
 )
 
 func IsRootlessParent() bool {
@@ -68,7 +68,7 @@ func ParentMain(hostGatewayIP string) error {
 		return errors.New("should not be called when !IsRootlessParent()")
 	}
 	stateDir, err := RootlessKitStateDir()
-	logrus.Debugf("stateDir: %s", stateDir)
+	log.L.Debugf("stateDir: %s", stateDir)
 	if err != nil {
 		return fmt.Errorf("rootless containerd not running? (hint: use `containerd-rootless-setuptool.sh install` to start rootless containerd): %w", err)
 	}
@@ -77,10 +77,12 @@ func ParentMain(hostGatewayIP string) error {
 		return err
 	}
 
-	wd, err := os.Getwd()
+	detachedNetNSPath, err := detachedNetNS(stateDir)
 	if err != nil {
 		return err
 	}
+	detachNetNSMode := detachedNetNSPath != ""
+	log.L.Debugf("RootlessKit detach-netns mode: %v", detachNetNSMode)
 
 	// FIXME: remove dependency on `nsenter` binary
 	arg0, err := exec.LookPath("nsenter")
@@ -89,15 +91,30 @@ func ParentMain(hostGatewayIP string) error {
 	}
 	// args are compatible with both util-linux nsenter and busybox nsenter
 	args := []string{
-		"-r/",     // root dir (busybox nsenter wants this to be explicitly specified),
-		"-w" + wd, // work dir
-		"--preserve-credentials",
-		"-m", "-n", "-U",
+		"-r/", // root dir (busybox nsenter wants this to be explicitly specified),
+	}
+
+	// Only append wd if we do have a working dir
+	// - https://github.com/rootless-containers/usernetes/pull/327
+	// - https://github.com/containerd/nerdctl/issues/3328
+	wd, err := os.Getwd()
+	if err != nil {
+		log.L.WithError(err).Warn("unable to determine working directory")
+	} else {
+		args = append(args, "-w"+wd)
+		os.Setenv("PWD", wd)
+	}
+
+	args = append(args, "--preserve-credentials",
+		"-m", "-U",
 		"-t", strconv.Itoa(childPid),
 		"-F", // no fork
+	)
+	if !detachNetNSMode {
+		args = append(args, "-n")
 	}
 	args = append(args, os.Args...)
-	logrus.Debugf("rootless parent main: executing %q with %v", arg0, args)
+	log.L.Debugf("rootless parent main: executing %q with %v", arg0, args)
 
 	// Env vars corresponds to RootlessKit spec:
 	// https://github.com/rootless-containers/rootlesskit/tree/v0.13.1#environment-variables

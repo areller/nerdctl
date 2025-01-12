@@ -17,81 +17,128 @@
 package referenceutil
 
 import (
-	"fmt"
+	"errors"
 	"path"
 	"strings"
 
-	refdocker "github.com/containerd/containerd/reference/docker"
+	"github.com/distribution/reference"
 	"github.com/ipfs/go-cid"
+	"github.com/opencontainers/go-digest"
 )
 
-// Reference is a reference to an image.
-type Reference interface {
+type Protocol string
 
-	// String returns the full reference which can be understood by containerd.
-	String() string
+const IPFSProtocol Protocol = "ipfs"
+const IPNSProtocol Protocol = "ipns"
+const shortIDLength = 5
+
+var ErrLoadOCIArchiveRequired = errors.New("image must be loaded from archive before parsing image reference")
+
+type ImageReference struct {
+	Protocol    Protocol
+	Digest      digest.Digest
+	Tag         string
+	ExplicitTag string
+	Path        string
+	Domain      string
+
+	nn reference.Reference
 }
 
-// ParseAny parses the passed reference with allowing it to be non-docker reference.
-// If the ref has IPFS scheme or can be parsed as CID, it's parsed as an IPFS reference.
-// Otherwise it's parsed as a docker reference.
-func ParseAny(rawRef string) (Reference, error) {
-	if scheme, ref, err := ParseIPFSRefWithScheme(rawRef); err == nil {
-		return stringRef{scheme: scheme, s: ref}, nil
+func (ir *ImageReference) Name() string {
+	ret := ir.Domain
+	if ret != "" {
+		ret += "/"
 	}
-	if c, err := cid.Decode(rawRef); err == nil {
-		return c, nil
+	ret += ir.Path
+	return ret
+}
+
+func (ir *ImageReference) FamiliarName() string {
+	if ir.Protocol != "" && ir.Domain == "" {
+		return ir.Path
 	}
-	return ParseDockerRef(rawRef)
-}
-
-// ParseDockerRef parses the passed reference with assuming it's a docker reference.
-func ParseDockerRef(rawRef string) (refdocker.Named, error) {
-	return refdocker.ParseDockerRef(rawRef)
-}
-
-// ParseIPFSRefWithScheme parses the passed reference with assuming it's an IPFS reference with scheme prefix.
-func ParseIPFSRefWithScheme(name string) (scheme, ref string, err error) {
-	if strings.HasPrefix(name, "ipfs://") || strings.HasPrefix(name, "ipns://") {
-		return name[:4], name[7:], nil
+	if ir.nn != nil {
+		return reference.FamiliarName(ir.nn.(reference.Named))
 	}
-	return "", "", fmt.Errorf("reference is not an IPFS reference")
+	return ""
 }
 
-type stringRef struct {
-	scheme string
-	s      string
+func (ir *ImageReference) FamiliarMatch(pattern string) (bool, error) {
+	return reference.FamiliarMatch(pattern, ir.nn)
 }
 
-func (s stringRef) String() string {
-	return s.s
-}
-
-// SuggestContainerName generates a container name from name.
-// The result MUST NOT be parsed.
-func SuggestContainerName(rawRef, containerID string) string {
-	const shortIDLength = 5
-	if len(containerID) < shortIDLength {
-		panic(fmt.Errorf("got too short (< %d) container ID: %q", shortIDLength, containerID))
+func (ir *ImageReference) String() string {
+	if ir.Protocol != "" && ir.Domain == "" {
+		return ir.Path
 	}
-	name := "untitled-" + containerID[:shortIDLength]
-	if rawRef != "" {
-		r, err := ParseAny(rawRef)
-		if err == nil {
-			switch rr := r.(type) {
-			case refdocker.Named:
-				if rrName := rr.Name(); rrName != "" {
-					imageNameBased := path.Base(rrName)
-					if imageNameBased != "" {
-						name = imageNameBased + "-" + containerID[:shortIDLength]
-					}
-				}
-			case cid.Cid:
-				name = "ipfs" + "-" + rr.String()[:shortIDLength] + "-" + containerID[:shortIDLength]
-			case stringRef:
-				name = rr.scheme + "-" + rr.s[:shortIDLength] + "-" + containerID[:shortIDLength]
-			}
-		}
+	if ir.Path == "" && ir.Digest != "" {
+		return ir.Digest.String()
 	}
-	return name
+	if ir.nn != nil {
+		return ir.nn.String()
+	}
+	return ""
+}
+
+func (ir *ImageReference) SuggestContainerName(suffix string) string {
+	name := "untitled"
+	if ir.Protocol != "" && ir.Domain == "" {
+		name = string(ir.Protocol) + "-" + ir.String()[:shortIDLength]
+	} else if ir.Path != "" {
+		name = path.Base(ir.Path)
+	}
+	return name + "-" + suffix[:5]
+}
+
+func Parse(rawRef string) (*ImageReference, error) {
+	ir := &ImageReference{}
+
+	if strings.HasPrefix(rawRef, "ipfs://") {
+		ir.Protocol = IPFSProtocol
+		rawRef = rawRef[7:]
+	} else if strings.HasPrefix(rawRef, "ipns://") {
+		ir.Protocol = IPNSProtocol
+		rawRef = rawRef[7:]
+	} else if strings.HasPrefix(rawRef, "oci-archive://") {
+		// The image must be loaded from the specified archive path first
+		// before parsing the image reference specified in its OCI image manifest.
+		return nil, ErrLoadOCIArchiveRequired
+	}
+	if decodedCID, err := cid.Decode(rawRef); err == nil {
+		ir.Protocol = IPFSProtocol
+		rawRef = decodedCID.String()
+		ir.Path = rawRef
+		return ir, nil
+	}
+
+	if dgst, err := digest.Parse(rawRef); err == nil {
+		ir.Digest = dgst
+		return ir, nil
+	} else if dgst, err := digest.Parse("sha256:" + rawRef); err == nil {
+		ir.Digest = dgst
+		return ir, nil
+	}
+
+	var err error
+	ir.nn, err = reference.ParseNormalizedNamed(rawRef)
+	if err != nil {
+		return ir, err
+	}
+	if tg, ok := ir.nn.(reference.Tagged); ok {
+		ir.ExplicitTag = tg.Tag()
+	}
+	if tg, ok := ir.nn.(reference.Named); ok {
+		ir.nn = reference.TagNameOnly(tg)
+		ir.Domain = reference.Domain(tg)
+		ir.Path = reference.Path(tg)
+	}
+	if tg, ok := ir.nn.(reference.Tagged); ok {
+		ir.Tag = tg.Tag()
+	}
+	if tg, ok := ir.nn.(reference.Digested); ok {
+		ir.Digest = tg.Digest()
+	}
+
+	return ir, nil
 }

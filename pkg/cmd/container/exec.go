@@ -22,18 +22,20 @@ import (
 	"io"
 	"os"
 
-	"github.com/containerd/console"
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/consoleutil"
-	"github.com/containerd/nerdctl/pkg/flagutil"
-	"github.com/containerd/nerdctl/pkg/idgen"
-	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
-	"github.com/containerd/nerdctl/pkg/signalutil"
-	"github.com/containerd/nerdctl/pkg/taskutil"
 	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/sirupsen/logrus"
+
+	"github.com/containerd/console"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/consoleutil"
+	"github.com/containerd/nerdctl/v2/pkg/flagutil"
+	"github.com/containerd/nerdctl/v2/pkg/idgen"
+	"github.com/containerd/nerdctl/v2/pkg/idutil/containerwalker"
+	"github.com/containerd/nerdctl/v2/pkg/signalutil"
+	"github.com/containerd/nerdctl/v2/pkg/taskutil"
 )
 
 // Exec will find the right running container to run a new command.
@@ -104,7 +106,10 @@ func execActionWithContainer(ctx context.Context, client *containerd.Client, con
 
 	var con console.Console
 	if options.TTY {
-		con = console.Current()
+		con, err = consoleutil.Current()
+		if err != nil {
+			return err
+		}
 		defer con.Reset()
 		if err := con.SetRaw(); err != nil {
 			return err
@@ -113,7 +118,7 @@ func execActionWithContainer(ctx context.Context, client *containerd.Client, con
 	if !options.Detach {
 		if options.TTY {
 			if err := consoleutil.HandleConsoleResize(ctx, process, con); err != nil {
-				logrus.WithError(err).Error("console resize")
+				log.G(ctx).WithError(err).Error("console resize")
 			}
 		} else {
 			sigc := signalutil.ForwardAllSignals(ctx, process)
@@ -143,7 +148,7 @@ func generateExecProcessSpec(ctx context.Context, client *containerd.Client, con
 	if err != nil {
 		return nil, err
 	}
-	userOpts, err := GenerateUserOpts(options.User)
+	userOpts, err := generateUserOpts(options.User)
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +166,15 @@ func generateExecProcessSpec(ctx context.Context, client *containerd.Client, con
 
 	pspec := spec.Process
 	pspec.Terminal = options.TTY
+	if pspec.Terminal {
+		con, err := consoleutil.Current()
+		if err != nil {
+			return nil, err
+		}
+		if size, err := con.Size(); err == nil {
+			pspec.ConsoleSize = &specs.Box{Height: uint(size.Height), Width: uint(size.Width)}
+		}
+	}
 	pspec.Args = args[1:]
 
 	if options.Workdir != "" {

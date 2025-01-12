@@ -23,13 +23,15 @@ import (
 	"fmt"
 	"os/exec"
 
-	composecli "github.com/compose-spec/compose-go/cli"
-	compose "github.com/compose-spec/compose-go/types"
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/identifiers"
-	"github.com/containerd/nerdctl/pkg/composer/serviceparser"
-	"github.com/containerd/nerdctl/pkg/reflectutil"
-	"github.com/sirupsen/logrus"
+	composecli "github.com/compose-spec/compose-go/v2/cli"
+	compose "github.com/compose-spec/compose-go/v2/types"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/composer/serviceparser"
+	"github.com/containerd/nerdctl/v2/pkg/identifiers"
+	"github.com/containerd/nerdctl/v2/pkg/reflectutil"
 )
 
 // Options groups the command line options recommended for a Compose implementation (ProjectOptions) and extra options for nerdctl
@@ -61,8 +63,8 @@ func New(o Options, client *containerd.Client) (*Composer, error) {
 	}
 
 	if o.Project != "" {
-		if err := identifiers.Validate(o.Project); err != nil {
-			return nil, fmt.Errorf("got invalid project name %q: %w", o.Project, err)
+		if err := identifiers.ValidateDockerCompat(o.Project); err != nil {
+			return nil, fmt.Errorf("invalid project name: %w", err)
 		}
 	}
 
@@ -70,9 +72,16 @@ func New(o Options, client *containerd.Client) (*Composer, error) {
 	optionsFn = append(optionsFn,
 		composecli.WithOsEnv,
 		composecli.WithWorkingDirectory(o.ProjectDirectory),
-		composecli.WithEnvFile(o.EnvFile),
+	)
+	if o.EnvFile != "" {
+		optionsFn = append(optionsFn,
+			composecli.WithEnvFiles(o.EnvFile),
+		)
+	}
+	optionsFn = append(optionsFn,
 		composecli.WithConfigFileEnv,
 		composecli.WithDefaultConfigPath,
+		composecli.WithEnvFiles(),
 		composecli.WithDotEnv,
 		composecli.WithName(o.Project),
 	)
@@ -81,7 +90,7 @@ func New(o Options, client *containerd.Client) (*Composer, error) {
 	if err != nil {
 		return nil, err
 	}
-	project, err := composecli.ProjectFromOptions(projectOptions)
+	project, err := projectOptions.LoadProject(context.TODO())
 	if err != nil {
 		return nil, err
 	}
@@ -93,12 +102,16 @@ func New(o Options, client *containerd.Client) (*Composer, error) {
 		}
 		o.Profiles = append(o.Profiles, s.GetProfiles()...)
 	}
-	project.ApplyProfiles(o.Profiles)
+
+	project, err = project.WithProfiles(o.Profiles)
+	if err != nil {
+		return nil, err
+	}
 
 	if o.DebugPrintFull {
 		projectJSON, _ := json.MarshalIndent(project, "", "    ")
-		logrus.Debug("printing project JSON")
-		logrus.Debugf("%s", projectJSON)
+		log.L.Debug("printing project JSON")
+		log.L.Debugf("%s", projectJSON)
 	}
 
 	if unknown := reflectutil.UnknownNonEmptyFields(project,
@@ -111,7 +124,7 @@ func New(o Options, client *containerd.Client) (*Composer, error) {
 		"Secrets",
 		"Configs",
 		"ComposeFiles"); len(unknown) > 0 {
-		logrus.Warnf("Ignoring: %+v", unknown)
+		log.L.Warnf("Ignoring: %+v", unknown)
 	}
 
 	c := &Composer{
@@ -136,7 +149,7 @@ func (c *Composer) createNerdctlCmd(ctx context.Context, args ...string) *exec.C
 func (c *Composer) runNerdctlCmd(ctx context.Context, args ...string) error {
 	cmd := c.createNerdctlCmd(ctx, args...)
 	if c.DebugPrintFull {
-		logrus.Debugf("Running %v", cmd.Args)
+		log.G(ctx).Debugf("Running %v", cmd.Args)
 	}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("error while executing %v: %q: %w", cmd.Args, string(out), err)
@@ -147,8 +160,9 @@ func (c *Composer) runNerdctlCmd(ctx context.Context, args ...string) error {
 // Services returns the parsed Service objects in dependency order.
 func (c *Composer) Services(ctx context.Context, svcs ...string) ([]*serviceparser.Service, error) {
 	var services []*serviceparser.Service
-	if err := c.project.WithServices(svcs, func(svc compose.ServiceConfig) error {
-		parsed, err := serviceparser.Parse(c.project, svc)
+
+	if err := c.project.ForEachService(svcs, func(name string, svc *compose.ServiceConfig) error {
+		parsed, err := serviceparser.Parse(c.project, *svc)
 		if err != nil {
 			return err
 		}
@@ -163,7 +177,7 @@ func (c *Composer) Services(ctx context.Context, svcs ...string) ([]*servicepars
 // ServiceNames returns service names in dependency order.
 func (c *Composer) ServiceNames(svcs ...string) ([]string, error) {
 	var names []string
-	if err := c.project.WithServices(svcs, func(svc compose.ServiceConfig) error {
+	if err := c.project.ForEachService(svcs, func(name string, svc *compose.ServiceConfig) error {
 		names = append(names, svc.Name)
 		return nil
 	}); err != nil {

@@ -22,8 +22,9 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/labels"
+	containerd "github.com/containerd/containerd/v2/client"
+
+	"github.com/containerd/nerdctl/v2/pkg/labels"
 )
 
 type Found struct {

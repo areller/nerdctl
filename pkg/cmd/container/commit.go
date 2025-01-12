@@ -22,17 +22,18 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
-	"github.com/containerd/nerdctl/pkg/imgutil/commit"
-	"github.com/containerd/nerdctl/pkg/referenceutil"
-	"github.com/sirupsen/logrus"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/idutil/containerwalker"
+	"github.com/containerd/nerdctl/v2/pkg/imgutil/commit"
+	"github.com/containerd/nerdctl/v2/pkg/referenceutil"
 )
 
 // Commit will commit a container’s file changes or settings into a new image.
 func Commit(ctx context.Context, client *containerd.Client, rawRef string, req string, options types.ContainerCommitOptions) error {
-	named, err := referenceutil.ParseDockerRef(rawRef)
+	parsedReference, err := referenceutil.Parse(rawRef)
 	if err != nil {
 		return err
 	}
@@ -45,7 +46,7 @@ func Commit(ctx context.Context, client *containerd.Client, rawRef string, req s
 	opts := &commit.Opts{
 		Author:  options.Author,
 		Message: options.Message,
-		Ref:     named.String(),
+		Ref:     parsedReference.String(),
 		Pause:   options.Pause,
 		Changes: changes,
 	}
@@ -56,11 +57,11 @@ func Commit(ctx context.Context, client *containerd.Client, rawRef string, req s
 			if found.MatchCount > 1 {
 				return fmt.Errorf("multiple IDs found with provided prefix: %s", found.Req)
 			}
-			imageID, err := commit.Commit(ctx, client, found.Container, opts)
+			imageID, err := commit.Commit(ctx, client, found.Container, opts, options.GOptions)
 			if err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(options.Stdout, "%s\n", imageID)
+			_, err = fmt.Fprintln(options.Stdout, imageID)
 			return err
 		},
 	}
@@ -96,7 +97,7 @@ func parseChanges(userChanges []string) (commit.Changes, error) {
 				return commit.Changes{}, fmt.Errorf("malformed json in change flag value %q", change)
 			}
 			if changes.CMD != nil {
-				logrus.Warn("multiple change flags supplied for the CMD directive, overriding with last supplied")
+				log.L.Warn("multiple change flags supplied for the CMD directive, overriding with last supplied")
 			}
 			changes.CMD = overrideCMD
 		case entrypointDirective:
@@ -105,7 +106,7 @@ func parseChanges(userChanges []string) (commit.Changes, error) {
 				return commit.Changes{}, fmt.Errorf("malformed json in change flag value %q", change)
 			}
 			if changes.Entrypoint != nil {
-				logrus.Warnf("multiple change flags supplied for the Entrypoint directive, overriding with last supplied")
+				log.L.Warnf("multiple change flags supplied for the Entrypoint directive, overriding with last supplied")
 			}
 			changes.Entrypoint = overrideEntrypoint
 		default: // TODO: Support the rest of the change directives

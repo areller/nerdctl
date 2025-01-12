@@ -5,6 +5,12 @@
 
 # nerdctl: Docker-compatible CLI for containerd
 
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/nerdctl.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/nerdctl-white.svg">
+  <img alt="logo" src="docs/images/nerdctl.svg">
+</picture>
+
 `nerdctl` is a Docker-compatible CLI for [contai**nerd**](https://containerd.io).
 
  ✅ Same UI/UX as `docker`
@@ -125,11 +131,11 @@ Binaries are available here: <https://github.com/containerd/nerdctl/releases>
 In addition to containerd, the following components should be installed:
 
 - [CNI plugins](https://github.com/containernetworking/plugins): for using `nerdctl run`.
-  - v1.1.0 or later is highly recommended. Older versions require extra [CNI isolation plugin](https://github.com/AkihiroSuda/cni-isolation) for isolating bridge networks (`nerdctl network create`).
+  - v1.1.0 or later is highly recommended.
 - [BuildKit](https://github.com/moby/buildkit) (OPTIONAL): for using `nerdctl build`. BuildKit daemon (`buildkitd`) needs to be running. See also [the document about setting up BuildKit](./docs/build.md).
   - v0.11.0 or later is highly recommended. Some features, such as pruning caches with `nerdctl system prune`, do not work with older versions.
 - [RootlessKit](https://github.com/rootless-containers/rootlesskit) and [slirp4netns](https://github.com/rootless-containers/slirp4netns) (OPTIONAL): for [Rootless mode](./docs/rootless.md)
-  - RootlessKit needs to be v0.10.0 or later. v0.14.1 or later is recommended.
+  - RootlessKit needs to be v0.10.0 or later. v2.0.0 or later is recommended.
   - slirp4netns needs to be v0.4.0 or later. v1.1.7 or later is recommended.
 
 These dependencies are included in `nerdctl-full-<VERSION>-<OS>-<ARCH>.tar.gz`, but not included in `nerdctl-<VERSION>-<OS>-<ARCH>.tar.gz`.
@@ -184,14 +190,12 @@ Also, `nerdctl` might be potentially useful for debugging Kubernetes clusters, b
 
 Major:
 
-- On-demand image pulling (lazy-pulling) using [Stargz](./docs/stargz.md)/[Nydus](./docs/nydus.md)/[OverlayBD](./docs/overlaybd.md) Snapshotter: `nerdctl --snapshotter=stargz|nydus|overlaybd run IMAGE` .
+- On-demand image pulling (lazy-pulling) using [Stargz](./docs/stargz.md)/[Nydus](./docs/nydus.md)/[OverlayBD](./docs/overlaybd.md)/[SOCI](./docs/soci.md) Snapshotter: `nerdctl --snapshotter=stargz|nydus|overlaybd|soci run IMAGE` .
 - [Image encryption and decryption using ocicrypt (imgcrypt)](./docs/ocicrypt.md): `nerdctl image (encrypt|decrypt) SRC DST`
 - [P2P image distribution using IPFS](./docs/ipfs.md): `nerdctl run ipfs://CID` .
   P2P image distribution (IPFS) is completely optional. Your host is NOT connected to any P2P network, unless you opt in to [install and run IPFS daemon](https://docs.ipfs.io/install/).
-- Recursive read-only (RRO) bind-mount: `nerdctl run -v /mnt:/mnt:rro` (make children such as `/mnt/usb` to be read-only, too).
-  Requires kernel >= 5.12, and crun >= 1.4 or runc >= 1.1 (PR [#3272](https://github.com/opencontainers/runc/pull/3272)).
 - [Cosign integration](./docs/cosign.md): `nerdctl pull --verify=cosign` and `nerdctl push --sign=cosign`, and [in Compose](./docs/cosign.md#cosign-in-compose)
-- [Accelerated rootless containers using bypass4netns](./docs/rootless.md): `nerdctl run --label nerdctl/bypass4netns=true`
+- [Accelerated rootless containers using bypass4netns](./docs/rootless.md): `nerdctl run --annotation nerdctl/bypass4netns=true`
 
 Minor:
 
@@ -205,11 +209,17 @@ Minor:
 - Better multi-platform support, e.g., `nerdctl pull --all-platforms IMAGE`
 - Applying an (existing) AppArmor profile to rootless containers: `nerdctl run --security-opt apparmor=<PROFILE>`.
   Use `sudo nerdctl apparmor load` to load the `nerdctl-default` profile.
+- Systemd compatibility support: `nerdctl run --systemd=always`
 
 Trivial:
 
 - Inspecting raw OCI config: `nerdctl container inspect --mode=native` .
 
+## Features implemented in `nerdctl` ahead of Docker
+
+- Recursive read-only (RRO) bind-mount: `nerdctl run -v /mnt:/mnt:rro` (make children such as `/mnt/usb` to be read-only, too).
+  Requires kernel >= 5.12.
+The same feature was later introduced in Docker v25 with a different syntax. nerdctl will support Docker v25 syntax too in the future.
 ## Similar tools
 
 - [`ctr`](https://github.com/containerd/containerd/tree/main/cmd/ctr): incompatible with Docker CLI, and not friendly to users.
@@ -243,30 +253,11 @@ Run `make && sudo make install`.
 
 See the header of [`go.mod`](./go.mod) for the minimum supported version of Go.
 
-Using `go install github.com/containerd/nerdctl/cmd/nerdctl` is possible, but unrecommended because it does not fill version strings printed in `nerdctl version`
+Using `go install github.com/containerd/nerdctl/v2/cmd/nerdctl` is possible, but unrecommended because it does not fill version strings printed in `nerdctl version`
 
-### Test suite
+### Testing
 
-#### Running unit tests
-
-Run `go test -v ./pkg/...`
-
-#### Running integration test suite against nerdctl
-
-Run `go test -exec sudo -v ./cmd/nerdctl/...` after `make && sudo make install`.
-
-For testing rootless mode, `-exec sudo` is not needed.
-
-To run tests in a container:
-
-```bash
-docker build -t test-integration --target test-integration .
-docker run -t --rm --privileged test-integration
-```
-
-#### Running integration test suite against Docker
-
-Run `go test -exec sudo -v ./cmd/nerdctl/... -args -test.target=docker` to ensure that the test suite is compatible with Docker.
+See [testing nerdctl](docs/testing/README.md).
 
 ### Contributing to nerdctl
 

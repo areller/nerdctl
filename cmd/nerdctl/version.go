@@ -23,12 +23,16 @@ import (
 	"os"
 	"text/template"
 
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/clientutil"
-	"github.com/containerd/nerdctl/pkg/formatter"
-	"github.com/containerd/nerdctl/pkg/infoutil"
-	"github.com/containerd/nerdctl/pkg/inspecttypes/dockercompat"
 	"github.com/spf13/cobra"
+
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/cmd/nerdctl/helpers"
+	"github.com/containerd/nerdctl/v2/pkg/clientutil"
+	"github.com/containerd/nerdctl/v2/pkg/formatter"
+	"github.com/containerd/nerdctl/v2/pkg/infoutil"
+	"github.com/containerd/nerdctl/v2/pkg/inspecttypes/dockercompat"
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
 )
 
 func newVersionCommand() *cobra.Command {
@@ -50,7 +54,7 @@ func newVersionCommand() *cobra.Command {
 func versionAction(cmd *cobra.Command, args []string) error {
 	var w io.Writer = os.Stdout
 	var tmpl *template.Template
-	globalOptions, err := processRootCmdFlags(cmd)
+	globalOptions, err := helpers.ProcessRootCmdFlags(cmd)
 	if err != nil {
 		return err
 	}
@@ -66,17 +70,27 @@ func versionAction(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	v, vErr := versionInfo(cmd, globalOptions)
+	address := globalOptions.Address
+	// rootless `nerdctl version` runs in the host namespaces, so the address is different
+	if rootlessutil.IsRootless() {
+		address, err = rootlessutil.RootlessContainredSockAddress()
+		if err != nil {
+			log.L.WithError(err).Warning("failed to inspect the rootless containerd socket address")
+			address = ""
+		}
+	}
+
+	v, vErr := versionInfo(cmd, globalOptions.Namespace, address)
 	if tmpl != nil {
 		var b bytes.Buffer
 		if err := tmpl.Execute(&b, v); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(w, b.String()+"\n"); err != nil {
+		if _, err := fmt.Fprintln(w, b.String()); err != nil {
 			return err
 		}
 	} else {
-		fmt.Fprintf(w, "Client:\n")
+		fmt.Fprintln(w, "Client:")
 		fmt.Fprintf(w, " Version:\t%s\n", v.Client.Version)
 		fmt.Fprintf(w, " OS/Arch:\t%s/%s\n", v.Client.Os, v.Client.Arch)
 		fmt.Fprintf(w, " Git commit:\t%s\n", v.Client.GitCommit)
@@ -88,8 +102,8 @@ func versionAction(cmd *cobra.Command, args []string) error {
 			}
 		}
 		if v.Server != nil {
-			fmt.Fprintf(w, "\n")
-			fmt.Fprintf(w, "Server:\n")
+			fmt.Fprintln(w)
+			fmt.Fprintln(w, "Server:")
 			for _, compo := range v.Server.Components {
 				fmt.Fprintf(w, " %s:\n", compo.Name)
 				fmt.Fprintf(w, "  Version:\t%s\n", compo.Version)
@@ -102,13 +116,16 @@ func versionAction(cmd *cobra.Command, args []string) error {
 	return vErr
 }
 
-// versionInfo may return partial VersionInfo on error
-func versionInfo(cmd *cobra.Command, globalOptions types.GlobalCommandOptions) (dockercompat.VersionInfo, error) {
-
+// versionInfo may return partial VersionInfo on error.
+// Address can be empty to skip inspecting the server.
+func versionInfo(cmd *cobra.Command, ns, address string) (dockercompat.VersionInfo, error) {
 	v := dockercompat.VersionInfo{
 		Client: infoutil.ClientVersion(),
 	}
-	client, ctx, cancel, err := clientutil.NewClient(cmd.Context(), globalOptions.Namespace, globalOptions.Address)
+	if address == "" {
+		return v, nil
+	}
+	client, ctx, cancel, err := clientutil.NewClient(cmd.Context(), ns, address)
 	if err != nil {
 		return v, err
 	}

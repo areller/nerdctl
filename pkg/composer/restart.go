@@ -21,11 +21,12 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/compose-spec/compose-go/types"
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/labels"
+	"github.com/compose-spec/compose-go/v2/types"
 
-	"github.com/sirupsen/logrus"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/labels"
 )
 
 // RestartOptions stores all option input from `nerdctl compose restart`
@@ -37,16 +38,13 @@ type RestartOptions struct {
 // `nerdctl restart CONTAINER_ID` to do the actual job.
 func (c *Composer) Restart(ctx context.Context, opt RestartOptions, services []string) error {
 	// in dependency order
-	return c.project.WithServices(services, func(svc types.ServiceConfig) error {
+	return c.project.ForEachService(services, func(name string, svc *types.ServiceConfig) error {
 		containers, err := c.Containers(ctx, svc.Name)
 		if err != nil {
 			return err
 		}
 
-		if err := c.restartContainers(ctx, containers, opt); err != nil {
-			return err
-		}
-		return nil
+		return c.restartContainers(ctx, containers, opt)
 	})
 }
 
@@ -64,14 +62,14 @@ func (c *Composer) restartContainers(ctx context.Context, containers []container
 		go func() {
 			defer rsWG.Done()
 			info, _ := container.Info(ctx, containerd.WithoutRefreshedMetadata)
-			logrus.Infof("Restarting container %s", info.Labels[labels.Name])
+			log.G(ctx).Infof("Restarting container %s", info.Labels[labels.Name])
 			args := []string{"restart"}
 			if opt.Timeout != nil {
 				args = append(args, timeoutArg)
 			}
 			args = append(args, container.ID())
 			if err := c.runNerdctlCmd(ctx, args...); err != nil {
-				logrus.Warn(err)
+				log.G(ctx).Warn(err)
 			}
 		}()
 	}

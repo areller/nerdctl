@@ -22,18 +22,21 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/compose-spec/compose-go/types"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/nerdctl/pkg/reflectutil"
+	"github.com/compose-spec/compose-go/v2/types"
+	securejoin "github.com/cyphar/filepath-securejoin"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/identifiers"
+	"github.com/containerd/nerdctl/v2/pkg/reflectutil"
 )
 
 func parseBuildConfig(c *types.BuildConfig, project *types.Project, imageName string) (*Build, error) {
 	if unknown := reflectutil.UnknownNonEmptyFields(c,
-		"Context", "Dockerfile", "Args", "CacheFrom", "Target", "Labels",
+		"Context", "Dockerfile", "Args", "CacheFrom", "Target", "Labels", "Secrets",
 	); len(unknown) > 0 {
-		logrus.Warnf("Ignoring: build: %+v", unknown)
+		log.L.Warnf("Ignoring: build: %+v", unknown)
 	}
 
 	if c.Context == "" {
@@ -42,16 +45,13 @@ func parseBuildConfig(c *types.BuildConfig, project *types.Project, imageName st
 	if strings.Contains(c.Context, "://") {
 		return nil, fmt.Errorf("build: URL-style context (%q) is not supported yet: %w", c.Context, errdefs.ErrNotImplemented)
 	}
-	if filepath.IsAbs(c.Context) {
-		logrus.Warnf("build.config should be relative path, got %q", c.Context)
-	}
 	ctxDir := project.RelativePath(c.Context)
 
 	var b Build
 	b.BuildArgs = append(b.BuildArgs, "-t="+imageName)
 	if c.Dockerfile != "" {
 		if filepath.IsAbs(c.Dockerfile) {
-			logrus.Warnf("build.dockerfile should be relative path, got %q", c.Dockerfile)
+			log.L.Warnf("build.dockerfile should be relative path, got %q", c.Dockerfile)
 			b.BuildArgs = append(b.BuildArgs, "-f="+c.Dockerfile)
 		} else {
 			// no need to use securejoin
@@ -80,6 +80,35 @@ func parseBuildConfig(c *types.BuildConfig, project *types.Project, imageName st
 		for k, v := range c.Labels {
 			b.BuildArgs = append(b.BuildArgs, "--label="+k+"="+v)
 		}
+	}
+
+	for _, s := range c.Secrets {
+		fileRef := types.FileReferenceConfig(s)
+
+		if err := identifiers.ValidateDockerCompat(fileRef.Source); err != nil {
+			return nil, fmt.Errorf("invalid secret source name: %w", err)
+		}
+
+		projectSecret, ok := project.Secrets[fileRef.Source]
+		if !ok {
+			return nil, fmt.Errorf("build: secret %s is undefined", fileRef.Source)
+		}
+		var src string
+		if filepath.IsAbs(projectSecret.File) {
+			log.L.Warnf("build.secrets should be relative path, got %q", projectSecret.File)
+			src = projectSecret.File
+		} else {
+			var err error
+			src, err = securejoin.SecureJoin(ctxDir, projectSecret.File)
+			if err != nil {
+				return nil, err
+			}
+		}
+		id := fileRef.Source
+		if fileRef.Target != "" {
+			id = fileRef.Target
+		}
+		b.BuildArgs = append(b.BuildArgs, "--secret=id="+id+",src="+src)
 	}
 
 	b.BuildArgs = append(b.BuildArgs, ctxDir)

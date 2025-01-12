@@ -19,13 +19,17 @@ package portutil
 import (
 	"fmt"
 
-	"github.com/containerd/nerdctl/pkg/portutil/procnet"
+	"github.com/containerd/nerdctl/v2/pkg/portutil/iptable"
+	"github.com/containerd/nerdctl/v2/pkg/portutil/procnet"
 )
 
 const (
 	// This port range is compatible with Docker, FYI https://github.com/moby/moby/blob/eb9e42a09ee123af1d95bf7d46dd738258fa2109/libnetwork/portallocator/portallocator_unix.go#L7-L12
+	allocateEnd = 60999
+)
+
+var (
 	allocateStart = 49153
-	allocateEnd   = 60999
 )
 
 func filter(ss []procnet.NetworkDetail, filterFunc func(detail procnet.NetworkDetail) bool) (ret []procnet.NetworkDetail) {
@@ -71,6 +75,17 @@ func portAllocate(protocol string, ip string, count uint64) (uint64, uint64, err
 	for _, value := range netprocItems {
 		usedPort[value.LocalPort] = true
 	}
+
+	ipTableItems, err := iptable.ReadIPTables("nat")
+	if err != nil {
+		return 0, 0, err
+	}
+	destinationPorts := iptable.ParseIPTableRules(ipTableItems)
+
+	for _, port := range destinationPorts {
+		usedPort[port] = true
+	}
+
 	start := uint64(allocateStart)
 	if count > uint64(allocateEnd-allocateStart+1) {
 		return 0, 0, fmt.Errorf("can not allocate %d ports", count)
@@ -84,6 +99,7 @@ func portAllocate(protocol string, ip string, count uint64) (uint64, uint64, err
 			}
 		}
 		if needReturn {
+			allocateStart = int(start + count)
 			return start, start + count - 1, nil
 		}
 		start += count

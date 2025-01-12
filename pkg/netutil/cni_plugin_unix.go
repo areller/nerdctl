@@ -1,4 +1,4 @@
-//go:build freebsd || linux
+//go:build unix
 
 /*
    Copyright The containerd Authors.
@@ -18,6 +18,8 @@
 
 package netutil
 
+import "github.com/containerd/nerdctl/v2/pkg/rootlessutil"
+
 // bridgeConfig describes the bridge plugin
 type bridgeConfig struct {
 	PluginType   string                 `json:"type"`
@@ -31,12 +33,14 @@ type bridgeConfig struct {
 	PromiscMode  bool                   `json:"promiscMode,omitempty"`
 	Vlan         int                    `json:"vlan,omitempty"`
 	IPAM         map[string]interface{} `json:"ipam"`
+	Capabilities map[string]bool        `json:"capabilities,omitempty"`
 }
 
 func newBridgePlugin(bridgeName string) *bridgeConfig {
 	return &bridgeConfig{
-		PluginType: "bridge",
-		BrName:     bridgeName,
+		PluginType:   "bridge",
+		BrName:       bridgeName,
+		Capabilities: map[string]bool{},
 	}
 }
 
@@ -46,16 +50,18 @@ func (*bridgeConfig) GetPluginType() string {
 
 // vlanConfig describes the macvlan/ipvlan config
 type vlanConfig struct {
-	PluginType string                 `json:"type"`
-	Master     string                 `json:"master"`
-	Mode       string                 `json:"mode,omitempty"`
-	MTU        int                    `json:"mtu,omitempty"`
-	IPAM       map[string]interface{} `json:"ipam"`
+	PluginType   string                 `json:"type"`
+	Master       string                 `json:"master"`
+	Mode         string                 `json:"mode,omitempty"`
+	MTU          int                    `json:"mtu,omitempty"`
+	IPAM         map[string]interface{} `json:"ipam"`
+	Capabilities map[string]bool        `json:"capabilities,omitempty"`
 }
 
 func newVLANPlugin(pluginType string) *vlanConfig {
 	return &vlanConfig{
-		PluginType: pluginType,
+		PluginType:   pluginType,
+		Capabilities: map[string]bool{},
 	}
 }
 
@@ -93,10 +99,15 @@ type firewallConfig struct {
 }
 
 func newFirewallPlugin() *firewallConfig {
-	return &firewallConfig{
+	c := &firewallConfig{
 		PluginType:    "firewall",
 		IngressPolicy: "same-bridge",
 	}
+	if rootlessutil.IsRootless() {
+		// https://github.com/containerd/nerdctl/issues/2818
+		c.Backend = "iptables"
+	}
+	return c
 }
 
 func (*firewallConfig) GetPluginType() string {
@@ -133,10 +144,25 @@ func newHostLocalIPAMConfig() *hostLocalIPAMConfig {
 	}
 }
 
-// https://github.com/containernetworking/plugins/blob/v1.1.0/plugins/ipam/dhcp/main.go#L43-L54
+// https://github.com/containernetworking/plugins/blob/v1.4.1/plugins/ipam/dhcp/main.go#L43-L54
 type dhcpIPAMConfig struct {
-	Type             string `json:"type"`
-	DaemonSocketPath string `json:"daemonSocketPath,omitempty"`
+	Type             string          `json:"type"`
+	DaemonSocketPath string          `json:"daemonSocketPath"`
+	ProvideOptions   []provideOption `json:"provide,omitempty"`
+	RequestOptions   []requestOption `json:"request,omitempty"`
+}
+
+type provideOption struct {
+	Option string `json:"option"`
+
+	Value           string `json:"value"`
+	ValueFromCNIArg string `json:"fromArg"`
+}
+
+type requestOption struct {
+	SkipDefault bool `json:"skipDefault"`
+
+	Option string `json:"option"`
 }
 
 func newDHCPIPAMConfig() *dhcpIPAMConfig {

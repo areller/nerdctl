@@ -19,55 +19,77 @@ package volume
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/inspecttypes/dockercompat"
-	"github.com/containerd/nerdctl/pkg/labels"
-	"github.com/containerd/nerdctl/pkg/mountutil"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/inspecttypes/dockercompat"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
+	"github.com/containerd/nerdctl/v2/pkg/mountutil"
 )
 
 func Remove(ctx context.Context, client *containerd.Client, volumes []string, options types.VolumeRemoveOptions) error {
-	containers, err := client.Containers(ctx)
-	if err != nil {
-		return err
-	}
 	volStore, err := Store(options.GOptions.Namespace, options.GOptions.DataRoot, options.GOptions.Address)
 	if err != nil {
 		return err
 	}
-	usedVolumes, err := usedVolumes(ctx, containers)
+
+	containers, err := client.Containers(ctx)
 	if err != nil {
 		return err
 	}
 
-	var volumenames []string // nolint: prealloc
-	for _, name := range volumes {
-		volume, err := volStore.Get(name, false)
+	// Note: to avoid racy behavior, this is called by volStore.Remove *inside a lock*
+	removableVolumes := func() (volumeNames []string, cannotRemove []error, err error) {
+		usedVolumesList, err := usedVolumes(ctx, containers)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
-		if _, ok := usedVolumes[volume.Name]; ok {
-			return fmt.Errorf("volume %q is in use", name)
+
+		for _, name := range volumes {
+			if _, ok := usedVolumesList[name]; ok {
+				cannotRemove = append(cannotRemove, fmt.Errorf("volume %q is in use (%w)", name, errdefs.ErrFailedPrecondition))
+				continue
+			}
+			volumeNames = append(volumeNames, name)
 		}
-		volumenames = append(volumenames, name)
+
+		return volumeNames, cannotRemove, nil
 	}
-	removedNames, err := volStore.Remove(volumenames)
+
+	removedNames, cannotRemove, err := volStore.Remove(removableVolumes)
 	if err != nil {
 		return err
 	}
+	// Otherwise, output on stdout whatever was successful
 	for _, name := range removedNames {
 		fmt.Fprintln(options.Stdout, name)
 	}
-	return err
+	// Log the rest
+	for _, volErr := range cannotRemove {
+		log.G(ctx).Warn(volErr)
+	}
+	if len(cannotRemove) > 0 {
+		return errors.New("some volumes could not be removed")
+	}
+	return nil
 }
 
 func usedVolumes(ctx context.Context, containers []containerd.Container) (map[string]struct{}, error) {
-	usedVolumes := make(map[string]struct{})
+	usedVolumesList := make(map[string]struct{})
 	for _, c := range containers {
 		l, err := c.Labels(ctx)
 		if err != nil {
+			// Containerd note: there is no guarantee that the containers we got from the list still exist at this point
+			// If that is the case, just ignore and move on
+			if errors.Is(err, errdefs.ErrNotFound) {
+				log.G(ctx).Debugf("container %q is gone - ignoring", c.ID())
+				continue
+			}
 			return nil, err
 		}
 		mountsJSON, ok := l[labels.Mounts]
@@ -82,9 +104,9 @@ func usedVolumes(ctx context.Context, containers []containerd.Container) (map[st
 		}
 		for _, m := range mounts {
 			if m.Type == mountutil.Volume {
-				usedVolumes[m.Name] = struct{}{}
+				usedVolumesList[m.Name] = struct{}{}
 			}
 		}
 	}
-	return usedVolumes, nil
+	return usedVolumesList, nil
 }

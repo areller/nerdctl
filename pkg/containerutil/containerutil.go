@@ -18,6 +18,8 @@ package containerutil
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -26,25 +28,31 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerd/console"
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/runtime/restart"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/consoleutil"
-	"github.com/containerd/nerdctl/pkg/errutil"
-	"github.com/containerd/nerdctl/pkg/formatter"
-	"github.com/containerd/nerdctl/pkg/labels"
-	"github.com/containerd/nerdctl/pkg/nsutil"
-	"github.com/containerd/nerdctl/pkg/portutil"
-	"github.com/containerd/nerdctl/pkg/rootlessutil"
-	"github.com/containerd/nerdctl/pkg/signalutil"
-	"github.com/containerd/nerdctl/pkg/taskutil"
+	dockercliopts "github.com/docker/cli/opts"
+	dockeropts "github.com/docker/docker/opts"
 	"github.com/moby/sys/signal"
 	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/sirupsen/logrus"
+
+	"github.com/containerd/console"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/runtime/restart"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/consoleutil"
+	"github.com/containerd/nerdctl/v2/pkg/errutil"
+	"github.com/containerd/nerdctl/v2/pkg/formatter"
+	"github.com/containerd/nerdctl/v2/pkg/ipcutil"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
+	"github.com/containerd/nerdctl/v2/pkg/labels/k8slabels"
+	"github.com/containerd/nerdctl/v2/pkg/portutil"
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
+	"github.com/containerd/nerdctl/v2/pkg/signalutil"
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
+	"github.com/containerd/nerdctl/v2/pkg/taskutil"
 )
 
 // PrintHostPort writes to `writer` the public (HostIP:HostPort) of a given `containerPort/protocol` in a container.
@@ -103,6 +111,15 @@ func ContainerNetNSPath(ctx context.Context, c containerd.Container) (string, er
 		return "", fmt.Errorf("invalid target container: %s, should be running", c.ID())
 	}
 	return fmt.Sprintf("/proc/%d/ns/net", task.Pid()), nil
+}
+
+// UpdateStatusLabel updates the "containerd.io/restart.status"
+// label of the container according to the value of restart desired status.
+func UpdateStatusLabel(ctx context.Context, container containerd.Container, status containerd.ProcessStatus) error {
+	opt := containerd.WithAdditionalContainerLabels(map[string]string{
+		restart.StatusLabel: string(status),
+	})
+	return container.Update(ctx, containerd.UpdateContainerOpts(opt))
 }
 
 // UpdateExplicitlyStoppedLabel updates the "containerd.io/restart.explicitly-stopped"
@@ -198,7 +215,7 @@ func GenerateSharingPIDOpts(ctx context.Context, targetCon containerd.Container)
 }
 
 // Start starts `container` with `attach` flag. If `attach` is true, it will attach to the container's stdio.
-func Start(ctx context.Context, container containerd.Container, flagA bool, client *containerd.Client) (err error) {
+func Start(ctx context.Context, container containerd.Container, flagA bool, client *containerd.Client, detachKeys string) (err error) {
 	// defer the storage of start error in the dedicated label
 	defer func() {
 		if err != nil {
@@ -218,6 +235,10 @@ func Start(ctx context.Context, container containerd.Container, flagA bool, clie
 		return err
 	}
 
+	if err := ReconfigIPCContainer(ctx, container, client, lab); err != nil {
+		return err
+	}
+
 	process, err := container.Spec(ctx)
 	if err != nil {
 		return err
@@ -225,7 +246,10 @@ func Start(ctx context.Context, container containerd.Container, flagA bool, clie
 	flagT := process.Process.Terminal
 	var con console.Console
 	if flagA && flagT {
-		con = console.Current()
+		con, err = consoleutil.Current()
+		if err != nil {
+			return err
+		}
 		defer con.Reset()
 		if err := con.SetRaw(); err != nil {
 			return err
@@ -233,55 +257,80 @@ func Start(ctx context.Context, container containerd.Container, flagA bool, clie
 	}
 
 	logURI := lab[labels.LogURI]
-
+	namespace := lab[labels.Namespace]
 	cStatus := formatter.ContainerStatus(ctx, container)
 	if cStatus == "Up" {
-		logrus.Warnf("container %s is already running", container.ID())
+		log.G(ctx).Warnf("container %s is already running", container.ID())
 		return nil
 	}
+
+	_, restartPolicyExist := lab[restart.PolicyLabel]
+	if restartPolicyExist {
+		if err := UpdateStatusLabel(ctx, container, containerd.Running); err != nil {
+			return err
+		}
+	}
+
 	if err := UpdateExplicitlyStoppedLabel(ctx, container, false); err != nil {
 		return err
 	}
 	if oldTask, err := container.Task(ctx, nil); err == nil {
 		if _, err := oldTask.Delete(ctx); err != nil {
-			logrus.WithError(err).Debug("failed to delete old task")
+			log.G(ctx).WithError(err).Debug("failed to delete old task")
 		}
 	}
-	task, err := taskutil.NewTask(ctx, client, container, flagA, false, flagT, true, con, logURI)
+	detachC := make(chan struct{})
+	attachStreamOpt := []string{}
+	if flagA {
+		// In start, flagA attaches only STDOUT/STDERR
+		// source: https://github.com/containerd/nerdctl/blob/main/docs/command-reference.md#whale-nerdctl-start
+		attachStreamOpt = []string{"STDOUT", "STDERR"}
+	}
+	task, err := taskutil.NewTask(ctx, client, container, attachStreamOpt, false, flagT, true, con, logURI, detachKeys, namespace, detachC)
 	if err != nil {
 		return err
-	}
-
-	var statusC <-chan containerd.ExitStatus
-	if flagA {
-		statusC, err = task.Wait(ctx)
-		if err != nil {
-			return err
-		}
 	}
 
 	if err := task.Start(ctx); err != nil {
 		return err
 	}
-
 	if !flagA {
 		return nil
 	}
 	if flagA && flagT {
 		if err := consoleutil.HandleConsoleResize(ctx, task, con); err != nil {
-			logrus.WithError(err).Error("console resize")
+			log.G(ctx).WithError(err).Error("console resize")
 		}
 	}
-
 	sigc := signalutil.ForwardAllSignals(ctx, task)
 	defer signalutil.StopCatch(sigc)
-	status := <-statusC
-	code, _, err := status.Result()
+
+	statusC, err := task.Wait(ctx)
 	if err != nil {
 		return err
 	}
-	if code != 0 {
-		return errutil.NewExitCoderErr(int(code))
+	select {
+	// io.Wait() would return when either 1) the user detaches from the container OR 2) the container is about to exit.
+	//
+	// If we replace the `select` block with io.Wait() and
+	// directly use task.Status() to check the status of the container after io.Wait() returns,
+	// it can still be running even though the container is about to exit (somehow especially for Windows).
+	//
+	// As a result, we need a separate detachC to distinguish from the 2 cases mentioned above.
+	case <-detachC:
+		io := task.IO()
+		if io == nil {
+			return errors.New("got a nil IO from the task")
+		}
+		io.Wait()
+	case status := <-statusC:
+		code, _, err := status.Result()
+		if err != nil {
+			return err
+		}
+		if code != 0 {
+			return errutil.NewExitCoderErr(int(code))
+		}
 	}
 	return nil
 }
@@ -302,9 +351,19 @@ func Stop(ctx context.Context, container containerd.Container, timeout *time.Dur
 	if err != nil {
 		return err
 	}
+	ipc, err := ipcutil.DecodeIPCLabel(l[labels.IPC])
+	if err != nil {
+		return err
+	}
+	// defer umount
+	defer func() {
+		if err := ipcutil.CleanUp(ipc); err != nil {
+			log.G(ctx).Warnf("failed to clean up IPC container %s: %s", container.ID(), err)
+		}
+	}()
 
 	if timeout == nil {
-		t, ok := l[labels.StopTimout]
+		t, ok := l[labels.StopTimeout]
 		if !ok {
 			// Default is 10 seconds.
 			t = "10"
@@ -318,6 +377,13 @@ func Stop(ctx context.Context, container containerd.Container, timeout *time.Dur
 
 	task, err := container.Task(ctx, cio.Load)
 	if err != nil {
+		// NOTE: NotFound doesn't mean that container hasn't started.
+		// In docker/CRI-containerd plugin, the task will be deleted
+		// when it exits. So, the status will be "created" for this
+		// case.
+		if errdefs.IsNotFound(err) {
+			return nil
+		}
 		return err
 	}
 
@@ -361,7 +427,7 @@ func Stop(ctx context.Context, container containerd.Container, timeout *time.Dur
 		// signal will be sent once resume is finished
 		if paused {
 			if err := task.Resume(ctx); err != nil {
-				logrus.Warnf("Cannot unpause container %s: %s", container.ID(), err)
+				log.G(ctx).Warnf("Cannot unpause container %s: %s", container.ID(), err)
 			} else {
 				// no need to do it again when send sigkill signal
 				paused = false
@@ -393,7 +459,7 @@ func Stop(ctx context.Context, container containerd.Container, timeout *time.Dur
 	// signal will be sent once resume is finished
 	if paused {
 		if err := task.Resume(ctx); err != nil {
-			logrus.Warnf("Cannot unpause container %s: %s", container.ID(), err)
+			log.G(ctx).Warnf("Cannot unpause container %s: %s", container.ID(), err)
 		}
 	}
 	return waitContainerStop(ctx, exitCh, container.ID())
@@ -463,10 +529,114 @@ func Unpause(ctx context.Context, client *containerd.Client, id string) error {
 	}
 }
 
-// Returns the path to the Nerdctl-managed state directory for the container with the given ID.
-func ContainerStateDirPath(globalOptions types.GlobalCommandOptions, dataStore, id string) (string, error) {
-	if err := nsutil.ValidateNamespaceName(globalOptions.Namespace); err != nil {
-		return "", fmt.Errorf("invalid namespace name %q for determining state dir of container %q: %s", globalOptions.Namespace, id, err)
+// ContainerStateDirPath returns the path to the Nerdctl-managed state directory for the container with the given ID.
+func ContainerStateDirPath(ns, dataStore, id string) (string, error) {
+	return filepath.Join(dataStore, "containers", ns, id), nil
+}
+
+// ContainerVolume is a struct representing a volume in a container.
+type ContainerVolume struct {
+	Type        string
+	Name        string
+	Source      string
+	Destination string
+	Mode        string
+	RW          bool
+	Propagation string
+}
+
+// GetContainerVolumes is a function that returns a slice of containerVolume pointers.
+// It accepts a map of container labels as input, where key is the label name and value is its associated value.
+// The function iterates over the predefined volume labels (AnonymousVolumes and Mounts)
+// and for each, it checks if the labels exists in the provided container labels.
+// If yes, it decodes the label value from JSON format and appends the volumes to the result.
+// In case of error during decoding, it logs the error and continues to the next label.
+func GetContainerVolumes(containerLabels map[string]string) []*ContainerVolume {
+	var vols []*ContainerVolume
+	volLabels := []string{labels.AnonymousVolumes, labels.Mounts}
+	for _, volLabel := range volLabels {
+		names, ok := containerLabels[volLabel]
+		if !ok {
+			continue
+		}
+		var (
+			volumes []*ContainerVolume
+			err     error
+		)
+		if volLabel == labels.Mounts {
+			err = json.Unmarshal([]byte(names), &volumes)
+		}
+		if volLabel == labels.AnonymousVolumes {
+			var anonymous []string
+			err = json.Unmarshal([]byte(names), &anonymous)
+			for _, anony := range anonymous {
+				volumes = append(volumes, &ContainerVolume{Name: anony})
+			}
+
+		}
+		if err != nil {
+			log.L.Warn(err)
+		}
+		vols = append(vols, volumes...)
 	}
-	return filepath.Join(dataStore, "containers", globalOptions.Namespace, id), nil
+	return vols
+}
+
+func GetContainerName(containerLabels map[string]string) string {
+	if name, ok := containerLabels[labels.Name]; ok {
+		return name
+	}
+
+	if ns, ok := containerLabels[k8slabels.PodNamespace]; ok {
+		if podName, ok := containerLabels[k8slabels.PodName]; ok {
+			if containerName, ok := containerLabels[k8slabels.ContainerName]; ok {
+				// Container
+				return fmt.Sprintf("k8s://%s/%s/%s", ns, podName, containerName)
+			}
+			// Pod sandbox
+			return fmt.Sprintf("k8s://%s/%s", ns, podName)
+		}
+	}
+	return ""
+}
+
+// EncodeContainerRmOptLabel encodes bool value for the --rm option into string value for a label.
+func EncodeContainerRmOptLabel(rmOpt bool) string {
+	return fmt.Sprintf("%t", rmOpt)
+}
+
+// DecodeContainerRmOptLabel decodes bool value for the --rm option from string value for a label.
+func DecodeContainerRmOptLabel(rmOptLabel string) (bool, error) {
+	return strconv.ParseBool(rmOptLabel)
+}
+
+// ParseExtraHosts takes an array of host-to-IP mapping strings, e.g. "localhost:127.0.0.1",
+// and a hostGatewayIP for resolving mappings to "host-gateway".
+//
+// Returns a map of host-to-IPs or errors if any mapping strings are not correctly formatted.
+func ParseExtraHosts(extraHosts []string, hostGatewayIP, separator string) ([]string, error) {
+	hosts := make([]string, 0, len(extraHosts))
+	for _, hostToIP := range strutil.DedupeStrSlice(extraHosts) {
+		if _, err := dockercliopts.ValidateExtraHost(hostToIP); err != nil {
+			return nil, err
+		}
+
+		parts := strings.SplitN(hostToIP, ":", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid host-to-IP map %s", hostToIP)
+		}
+
+		host, ip := parts[0], parts[1]
+
+		// If the IP address is a string called "host-gateway", replace this value with the IP address stored
+		// in the daemon level HostGatewayIP config variable.
+		if ip == dockeropts.HostGatewayName && hostGatewayIP == "" {
+			return nil, errors.New("unable to derive the IP value for host-gateway")
+		} else if ip == dockeropts.HostGatewayName {
+			ip = hostGatewayIP
+		}
+
+		hosts = append(hosts, host+separator+ip)
+	}
+	return hosts, nil
 }

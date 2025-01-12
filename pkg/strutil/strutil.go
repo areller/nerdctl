@@ -36,7 +36,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/errdefs"
 )
 
 // ConvertKVStringsToMap is from https://github.com/moby/moby/blob/v20.10.0-rc2/runconfig/opts/parse.go
@@ -79,6 +79,19 @@ func DedupeStrSlice(in []string) []string {
 		}
 	}
 	return res
+}
+
+// SliceToSet converts a slice of strings into a set.
+// In Go, a set is often represented as a map with keys as the set elements and values as boolean.
+// This function iterates over the slice, adding each string as a key in the map.
+// The corresponding map value is set to true, serving as a placeholder.
+// The resulting map can be used to quickly check the presence of an element in the set.
+func SliceToSet(in []string) map[string]bool {
+	set := make(map[string]bool)
+	for _, s := range in {
+		set[s] = true
+	}
+	return set
 }
 
 // ParseCSVMap parses a string like "foo=x,bar=y" into a map

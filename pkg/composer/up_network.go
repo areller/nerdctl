@@ -20,10 +20,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/nerdctl/pkg/labels"
-	"github.com/containerd/nerdctl/pkg/reflectutil"
+	"github.com/containerd/log"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
+	"github.com/containerd/nerdctl/v2/pkg/reflectutil"
 )
 
 func (c *Composer) upNetwork(ctx context.Context, shortName string) error {
@@ -31,13 +31,13 @@ func (c *Composer) upNetwork(ctx context.Context, shortName string) error {
 	if !ok {
 		return fmt.Errorf("invalid network name %q", shortName)
 	}
-	if net.External.External {
+	if net.External {
 		// NOP
 		return nil
 	}
 
 	if unknown := reflectutil.UnknownNonEmptyFields(&net, "Name", "Ipam", "Driver", "DriverOpts"); len(unknown) > 0 {
-		logrus.Warnf("Ignoring: network %s: %+v", shortName, unknown)
+		log.G(ctx).Warnf("Ignoring: network %s: %+v", shortName, unknown)
 	}
 
 	// shortName is like "default", fullName is like "compose-wordpress_default"
@@ -46,7 +46,7 @@ func (c *Composer) upNetwork(ctx context.Context, shortName string) error {
 	if err != nil {
 		return err
 	} else if !netExists {
-		logrus.Infof("Creating network %s", fullName)
+		log.G(ctx).Infof("Creating network %s", fullName)
 		//add metadata labels to network https://github.com/compose-spec/compose-spec/blob/master/spec.md#labels-1
 		createArgs := []string{
 			fmt.Sprintf("--label=%s=%s", labels.ComposeProject, c.project.Name),
@@ -65,12 +65,12 @@ func (c *Composer) upNetwork(ctx context.Context, shortName string) error {
 
 		if net.Ipam.Config != nil {
 			if len(net.Ipam.Config) > 1 {
-				logrus.Warnf("Ignoring: network %s: imam.config %+v", shortName, net.Ipam.Config[1:])
+				log.G(ctx).Warnf("Ignoring: network %s: imam.config %+v", shortName, net.Ipam.Config[1:])
 			}
 
 			ipamConfig := net.Ipam.Config[0]
 			if unknown := reflectutil.UnknownNonEmptyFields(ipamConfig, "Subnet", "Gateway", "IPRange"); len(unknown) > 0 {
-				logrus.Warnf("Ignoring: network %s: ipam.config[0]: %+v", shortName, unknown)
+				log.G(ctx).Warnf("Ignoring: network %s: ipam.config[0]: %+v", shortName, unknown)
 			}
 			if ipamConfig.Subnet != "" {
 				createArgs = append(createArgs, fmt.Sprintf("--subnet=%s", ipamConfig.Subnet))
@@ -86,7 +86,7 @@ func (c *Composer) upNetwork(ctx context.Context, shortName string) error {
 		createArgs = append(createArgs, fullName)
 
 		if c.DebugPrintFull {
-			logrus.Debugf("Creating network args: %s", createArgs)
+			log.G(ctx).Debugf("Creating network args: %s", createArgs)
 		}
 
 		if err := c.runNerdctlCmd(ctx, append([]string{"network", "create"}, createArgs...)...); err != nil {

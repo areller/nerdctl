@@ -22,30 +22,32 @@ import (
 	"io"
 	"os"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/images/converter"
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/nerdctl/pkg/idutil/imagewalker"
-	"github.com/containerd/nerdctl/pkg/imgutil"
-	"github.com/containerd/nerdctl/pkg/platformutil"
-	"github.com/containerd/nerdctl/pkg/referenceutil"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/converter"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
 	"github.com/containerd/stargz-snapshotter/ipfs"
 	ipfsclient "github.com/containerd/stargz-snapshotter/ipfs/client"
-	"github.com/docker/docker/errdefs"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/sirupsen/logrus"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/idutil/imagewalker"
+	"github.com/containerd/nerdctl/v2/pkg/imgutil"
+	"github.com/containerd/nerdctl/v2/pkg/platformutil"
 )
 
 const ipfsPathEnv = "IPFS_PATH"
 
 // EnsureImage pull the specified image from IPFS.
-func EnsureImage(ctx context.Context, client *containerd.Client, stdout, stderr io.Writer, snapshotter string, scheme string, ref string, mode imgutil.PullMode, ocispecPlatforms []ocispec.Platform, unpack *bool, quiet bool, ipfsPath string) (*imgutil.EnsuredImage, error) {
-	switch mode {
+func EnsureImage(ctx context.Context, client *containerd.Client, scheme, ref, ipfsPath string, options types.ImagePullOptions) (*imgutil.EnsuredImage, error) {
+	switch options.Mode {
 	case "always", "missing", "never":
 		// NOP
 	default:
-		return nil, fmt.Errorf("unexpected pull mode: %q", mode)
+		return nil, fmt.Errorf("unexpected pull mode: %q", options.Mode)
 	}
 	switch scheme {
 	case "ipfs", "ipns":
@@ -55,15 +57,15 @@ func EnsureImage(ctx context.Context, client *containerd.Client, stdout, stderr 
 	}
 
 	// if not `always` pull and given one platform and image found locally, return existing image directly.
-	if mode != "always" && len(ocispecPlatforms) == 1 {
-		if res, err := imgutil.GetExistingImage(ctx, client, snapshotter, ref, ocispecPlatforms[0]); err == nil {
+	if options.Mode != "always" && len(options.OCISpecPlatform) == 1 {
+		if res, err := imgutil.GetExistingImage(ctx, client, options.GOptions.Snapshotter, ref, options.OCISpecPlatform[0]); err == nil {
 			return res, nil
 		} else if !errdefs.IsNotFound(err) {
 			return nil, err
 		}
 	}
 
-	if mode == "never" {
+	if options.Mode == "never" {
 		return nil, fmt.Errorf("image %q is not available", ref)
 	}
 	r, err := ipfs.NewResolver(ipfs.ResolverOptions{
@@ -73,7 +75,7 @@ func EnsureImage(ctx context.Context, client *containerd.Client, stdout, stderr 
 	if err != nil {
 		return nil, err
 	}
-	return imgutil.PullImage(ctx, client, stdout, stderr, snapshotter, r, ref, ocispecPlatforms, unpack, quiet)
+	return imgutil.PullImage(ctx, client, r, ref, options)
 }
 
 // Push pushes the specified image to IPFS.
@@ -85,16 +87,12 @@ func Push(ctx context.Context, client *containerd.Client, rawRef string, layerCo
 	ipath := lookupIPFSPath(ipfsPath)
 	if ensureImage {
 		// Ensure image contents are fully downloaded
-		logrus.Infof("ensuring image contents")
+		log.G(ctx).Infof("ensuring image contents")
 		if err := ensureContentsOfIPFSImage(ctx, client, rawRef, allPlatforms, platform, ipath); err != nil {
-			logrus.WithError(err).Warnf("failed to ensure the existence of image %q", rawRef)
+			log.G(ctx).WithError(err).Warnf("failed to ensure the existence of image %q", rawRef)
 		}
 	}
-	ref, err := referenceutil.ParseAny(rawRef)
-	if err != nil {
-		return "", err
-	}
-	return ipfs.PushWithIPFSPath(ctx, client, ref.String(), layerConvert, platMC, &ipath)
+	return ipfs.PushWithIPFSPath(ctx, client, rawRef, layerConvert, platMC, &ipath)
 }
 
 // ensureContentsOfIPFSImage ensures that the entire contents of an existing IPFS image are fully downloaded to containerd.

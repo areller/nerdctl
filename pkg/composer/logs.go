@@ -18,28 +18,46 @@ package composer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strings"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/composer/pipetagger"
-	"github.com/containerd/nerdctl/pkg/labels"
+	"github.com/compose-spec/compose-go/v2/types"
 
-	"github.com/sirupsen/logrus"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/composer/pipetagger"
+	"github.com/containerd/nerdctl/v2/pkg/composer/serviceparser"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
 )
 
 type LogsOptions struct {
-	Follow      bool
-	Timestamps  bool
-	Tail        string
-	NoColor     bool
-	NoLogPrefix bool
+	AbortOnContainerExit bool
+	Follow               bool
+	Timestamps           bool
+	Tail                 string
+	NoColor              bool
+	NoLogPrefix          bool
+	LatestRun            bool
 }
 
 func (c *Composer) Logs(ctx context.Context, lo LogsOptions, services []string) error {
-	serviceNames, err := c.ServiceNames(services...)
+	// Whether we called `compose logs`, or we are showing logs at the end of `up`, while in non detach mode, we need
+	// to release the lock. At this point, no operation will be performed that needs exclusive locking anymore, and
+	// not releasing the lock would otherwise unduly prevent further compose operations.
+	// See https://github.com/containerd/nerdctl/issues/3678
+	if err := Unlock(); err != nil {
+		return err
+	}
+
+	var serviceNames []string
+	err := c.project.ForEachService(services, func(name string, svc *types.ServiceConfig) error {
+		serviceNames = append(serviceNames, svc.Name)
+		return nil
+	}, types.IgnoreDependencies)
 	if err != nil {
 		return err
 	}
@@ -53,9 +71,10 @@ func (c *Composer) Logs(ctx context.Context, lo LogsOptions, services []string) 
 func (c *Composer) logs(ctx context.Context, containers []containerd.Container, lo LogsOptions) error {
 	var logTagMaxLen int
 	type containerState struct {
-		name   string
-		logTag string
-		logCmd *exec.Cmd
+		name      string
+		logTag    string
+		logCmd    *exec.Cmd
+		startedAt string
 	}
 
 	containerStates := make(map[string]containerState, len(containers)) // key: containerID
@@ -65,13 +84,19 @@ func (c *Composer) logs(ctx context.Context, containers []containerd.Container, 
 			return err
 		}
 		name := info.Labels[labels.Name]
-		logTag := strings.TrimPrefix(name, c.project.Name+"_")
+		logTag := strings.TrimPrefix(name, c.project.Name+serviceparser.Separator)
 		if l := len(logTag); l > logTagMaxLen {
 			logTagMaxLen = l
 		}
+		ts, err := info.UpdatedAt.MarshalText()
+		if err != nil {
+			return err
+		}
+
 		containerStates[container.ID()] = containerState{
-			name:   name,
-			logTag: logTag,
+			name:      name,
+			logTag:    logTag,
+			startedAt: string(ts),
 		}
 	}
 
@@ -93,6 +118,9 @@ func (c *Composer) logs(ctx context.Context, containers []containerd.Container, 
 				args = append(args, lo.Tail)
 			}
 		}
+		if lo.LatestRun {
+			args = append(args, fmt.Sprintf("--since=%s", state.startedAt))
+		}
 
 		args = append(args, id)
 		state.logCmd = c.createNerdctlCmd(ctx, args...)
@@ -111,7 +139,7 @@ func (c *Composer) logs(ctx context.Context, containers []containerd.Container, 
 		}
 		stderrTagger := pipetagger.New(os.Stderr, stderr, state.logTag, logWidth, lo.NoColor)
 		if c.DebugPrintFull {
-			logrus.Debugf("Running %v", state.logCmd.Args)
+			log.G(ctx).Debugf("Running %v", state.logCmd.Args)
 		}
 		if err := state.logCmd.Start(); err != nil {
 			return err
@@ -128,26 +156,33 @@ func (c *Composer) logs(ctx context.Context, containers []containerd.Container, 
 	signal.Notify(interruptChan, os.Interrupt)
 
 	logsEOFMap := make(map[string]struct{}) // key: container name
+	var containerError error
 selectLoop:
 	for {
 		// Wait for Ctrl-C, or `nerdctl compose down` in another terminal
 		select {
 		case sig := <-interruptChan:
-			logrus.Debugf("Received signal: %s", sig)
+			log.G(ctx).Debugf("Received signal: %s", sig)
 			break selectLoop
 		case containerName := <-logsEOFChan:
 			if lo.Follow {
 				// When `nerdctl logs -f` has exited, we can assume that the container has exited
-				logrus.Infof("Container %q exited", containerName)
+				log.G(ctx).Infof("Container %q exited", containerName)
+				// In case a container has exited and the parameter --abort-on-container-exit,
+				// we break the loop and set an error, so we can exit the program with 1
+				if lo.AbortOnContainerExit {
+					containerError = fmt.Errorf("container %q exited", containerName)
+					break selectLoop
+				}
 			} else {
-				logrus.Debugf("Logs for container %q reached EOF", containerName)
+				log.G(ctx).Debugf("Logs for container %q reached EOF", containerName)
 			}
 			logsEOFMap[containerName] = struct{}{}
 			if len(logsEOFMap) == len(containerStates) {
 				if lo.Follow {
-					logrus.Info("All the containers have exited")
+					log.G(ctx).Info("All the containers have exited")
 				} else {
-					logrus.Debug("All the logs reached EOF")
+					log.G(ctx).Debug("All the logs reached EOF")
 				}
 				break selectLoop
 			}
@@ -157,10 +192,10 @@ selectLoop:
 	for _, state := range containerStates {
 		if state.logCmd != nil && state.logCmd.Process != nil {
 			if err := state.logCmd.Process.Kill(); err != nil {
-				logrus.Warn(err)
+				log.G(ctx).Warn(err)
 			}
 		}
 	}
 
-	return nil
+	return containerError
 }

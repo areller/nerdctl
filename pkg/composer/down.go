@@ -20,9 +20,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/nerdctl/pkg/strutil"
+	"github.com/containerd/log"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
 )
 
 type DownOptions struct {
@@ -39,6 +39,10 @@ func (c *Composer) Down(ctx context.Context, downOptions DownOptions) error {
 	for _, svc := range strutil.ReverseStrSlice(serviceNames) {
 		containers, err := c.Containers(ctx, svc)
 		if err != nil {
+			return err
+		}
+		// use default Options to stop service containers.
+		if err := c.stopContainers(ctx, containers, StopOptions{}); err != nil {
 			return err
 		}
 		if err := c.removeContainers(ctx, containers, RemoveOptions{Stop: true, Volumes: downOptions.RemoveVolumes}); err != nil {
@@ -61,7 +65,7 @@ func (c *Composer) Down(ctx context.Context, downOptions DownOptions) error {
 				return fmt.Errorf("error removeing orphaned containers: %s", err)
 			}
 		} else {
-			logrus.Warnf("found %d orphaned containers: %v, you can run this command with the --remove-orphans flag to clean it up", len(orphans), orphans)
+			log.G(ctx).Warnf("found %d orphaned containers: %v, you can run this command with the --remove-orphans flag to clean it up", len(orphans), orphans)
 		}
 	}
 
@@ -87,7 +91,7 @@ func (c *Composer) downNetwork(ctx context.Context, shortName string) error {
 	if !ok {
 		return fmt.Errorf("invalid network name %q", shortName)
 	}
-	if net.External.External {
+	if net.External {
 		// NOP
 		return nil
 	}
@@ -105,9 +109,9 @@ func (c *Composer) downNetwork(ctx context.Context, shortName string) error {
 			return fmt.Errorf("network %s is in use", fullName)
 		}
 
-		logrus.Infof("Removing network %s", fullName)
+		log.G(ctx).Infof("Removing network %s", fullName)
 		if err := c.runNerdctlCmd(ctx, "network", "rm", fullName); err != nil {
-			logrus.Warn(err)
+			log.G(ctx).Warn(err)
 		}
 	}
 	return nil
@@ -118,19 +122,20 @@ func (c *Composer) downVolume(ctx context.Context, shortName string) error {
 	if !ok {
 		return fmt.Errorf("invalid volume name %q", shortName)
 	}
-	if vol.External.External {
+	if vol.External {
 		// NOP
 		return nil
 	}
 	// shortName is like "db_data", fullName is like "compose-wordpress_db_data"
 	fullName := vol.Name
+	// FIXME: this is racy. See note in up_volume.go
 	volExists, err := c.VolumeExists(fullName)
 	if err != nil {
 		return err
 	} else if volExists {
-		logrus.Infof("Removing volume %s", fullName)
+		log.G(ctx).Infof("Removing volume %s", fullName)
 		if err := c.runNerdctlCmd(ctx, "volume", "rm", "-f", fullName); err != nil {
-			logrus.Warn(err)
+			log.G(ctx).Warn(err)
 		}
 	}
 	return nil

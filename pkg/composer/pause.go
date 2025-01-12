@@ -22,10 +22,12 @@ import (
 	"io"
 	"sync"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/containerutil"
-	"github.com/containerd/nerdctl/pkg/labels"
 	"golang.org/x/sync/errgroup"
+
+	containerd "github.com/containerd/containerd/v2/client"
+
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
 )
 
 // Pause pauses service containers belonging to `services`.
@@ -55,7 +57,7 @@ func (c *Composer) Pause(ctx context.Context, services []string, writer io.Write
 
 			mu.Lock()
 			defer mu.Unlock()
-			_, err = fmt.Fprintf(writer, "%s\n", info.Labels[labels.Name])
+			_, err = fmt.Fprintln(writer, info.Labels[labels.Name])
 
 			return err
 		})
@@ -91,7 +93,7 @@ func (c *Composer) Unpause(ctx context.Context, services []string, writer io.Wri
 
 			mu.Lock()
 			defer mu.Unlock()
-			_, err = fmt.Fprintf(writer, "%s\n", info.Labels[labels.Name])
+			_, err = fmt.Fprintln(writer, info.Labels[labels.Name])
 
 			return err
 		})

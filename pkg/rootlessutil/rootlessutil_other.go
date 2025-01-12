@@ -25,7 +25,7 @@ package rootlessutil
 import (
 	"fmt"
 
-	"github.com/rootless-containers/rootlesskit/pkg/api/client"
+	"github.com/rootless-containers/rootlesskit/v2/pkg/api/client"
 )
 
 // Always returns false on non-Linux platforms.
@@ -61,4 +61,16 @@ func NewRootlessKitClient() (client.Client, error) {
 // Always errors out on non-Linux platforms.
 func ParentMain(hostGatewayIP string) error {
 	return fmt.Errorf("cannot use RootlessKit on main entry point on non-Linux hosts")
+}
+
+func RootlessContainredSockAddress() (string, error) {
+	return "", fmt.Errorf("cannot inspect RootlessKit state on non-Linux hosts")
+}
+
+func DetachedNetNS() (string, error) {
+	return "", nil
+}
+
+func WithDetachedNetNSIfAny(fn func() error) error {
+	return fn()
 }

@@ -17,10 +17,11 @@
 package main
 
 import (
-	ncdefaults "github.com/containerd/nerdctl/pkg/defaults"
-	"github.com/containerd/nerdctl/pkg/rootlessutil"
-	"github.com/containerd/nerdctl/pkg/strutil"
 	"github.com/spf13/cobra"
+
+	"github.com/containerd/nerdctl/v2/cmd/nerdctl/apparmor"
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
 )
 
 func appNeedsRootlessParentMain(cmd *cobra.Command, args []string) bool {
@@ -37,12 +38,20 @@ func appNeedsRootlessParentMain(cmd *cobra.Command, args []string) bool {
 		return true
 	}
 	switch commands[1] {
-	// completion, login, logout: false, because it shouldn't require the daemon to be running
+	// completion, login, logout, version: false, because it shouldn't require the daemon to be running
 	// apparmor: false, because it requires the initial mount namespace to access /sys/kernel/security
-	// cp: false, because it requires the initial mount namespace to inspect file owners
-	case "", "completion", "login", "logout", "apparmor", "cp":
+	// cp, compose cp: false, because it requires the initial mount namespace to inspect file owners
+	case "", "completion", "login", "logout", "apparmor", "cp", "version":
 		return false
 	case "container":
+		if len(commands) < 3 {
+			return true
+		}
+		switch commands[2] {
+		case "cp":
+			return false
+		}
+	case "compose":
 		if len(commands) < 3 {
 			return true
 		}
@@ -54,21 +63,6 @@ func appNeedsRootlessParentMain(cmd *cobra.Command, args []string) bool {
 	return true
 }
 
-func shellCompleteCgroupManagerNames(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	candidates := []string{"cgroupfs"}
-	if ncdefaults.IsSystemdAvailable() {
-		candidates = append(candidates, "systemd")
-	}
-	if rootlessutil.IsRootless() {
-		candidates = append(candidates, "none")
-	}
-	return candidates, cobra.ShellCompDirectiveNoFileComp
-}
-
 func addApparmorCommand(rootCmd *cobra.Command) {
-	rootCmd.AddCommand(newApparmorCommand())
-}
-
-func addCpCommand(rootCmd *cobra.Command) {
-	rootCmd.AddCommand(newCpCommand())
+	rootCmd.AddCommand(apparmor.NewApparmorCommand())
 }

@@ -24,17 +24,18 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/nerdctl/pkg/platformutil"
-	"github.com/containerd/nerdctl/pkg/systemutil"
 	"github.com/opencontainers/go-digest"
-	"github.com/sirupsen/logrus"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
+
+	"github.com/containerd/nerdctl/v2/pkg/platformutil"
+	"github.com/containerd/nerdctl/v2/pkg/systemutil"
 )
 
-func NewClient(ctx context.Context, namespace, address string, opts ...containerd.ClientOpt) (*containerd.Client, context.Context, context.CancelFunc, error) {
-
+func NewClient(ctx context.Context, namespace, address string, opts ...containerd.Opt) (*containerd.Client, context.Context, context.CancelFunc, error) {
 	ctx = namespaces.WithNamespace(ctx, namespace)
 
 	address = strings.TrimPrefix(address, "unix://")
@@ -56,15 +57,15 @@ func NewClient(ctx context.Context, namespace, address string, opts ...container
 	return client, ctx, cancel, nil
 }
 
-func NewClientWithPlatform(ctx context.Context, namespace, address, platform string, clientOpts ...containerd.ClientOpt) (*containerd.Client, context.Context, context.CancelFunc, error) {
+func NewClientWithPlatform(ctx context.Context, namespace, address, platform string, clientOpts ...containerd.Opt) (*containerd.Client, context.Context, context.CancelFunc, error) {
 	if platform != "" {
 		if canExec, canExecErr := platformutil.CanExecProbably(platform); !canExec {
 			warn := fmt.Sprintf("Platform %q seems incompatible with the host platform %q. If you see \"exec format error\", see https://github.com/containerd/nerdctl/blob/main/docs/multi-platform.md",
 				platform, platforms.DefaultString())
 			if canExecErr != nil {
-				logrus.WithError(canExecErr).Warn(warn)
+				log.L.WithError(canExecErr).Warn(warn)
 			} else {
-				logrus.Warn(warn)
+				log.L.Warn(warn)
 			}
 		}
 		platformParsed, err := platforms.Parse(platform)

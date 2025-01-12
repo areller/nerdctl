@@ -43,6 +43,10 @@ type BuilderBuildOptions struct {
 	Progress string
 	// Secret file to expose to the build: id=mysecret,src=/local/secret
 	Secret []string
+	// Allow extra privileged entitlement, e.g. network.host, security.insecure
+	Allow []string
+	// Attestation parameters (format: "type=sbom,generator=image")"
+	Attest []string
 	// SSH agent socket or keys to expose to the build (format: default|<id>[=<socket>|<key>[,<key>]])
 	SSH []string
 	// Quiet suppress the build output and print image ID on success
@@ -61,6 +65,14 @@ type BuilderBuildOptions struct {
 	Label []string
 	// BuildContext is the build context
 	BuildContext string
+	// ExtendedBuildContext is a pair of key=value (e.g. myorg/myapp=docker-image://path/to/image, dir2=/path/to/dir2)
+	ExtendedBuildContext []string
+	// NetworkMode mode for the build context
+	NetworkMode string
+	// Pull determines if we should try to pull latest image from remote. Default is buildkit's default.
+	Pull *bool
+	// ExtraHosts is a set of custom host-to-IP mappings.
+	ExtraHosts []string
 }
 
 // BuilderPruneOptions specifies options for `nerdctl builder prune`.
@@ -72,4 +84,6 @@ type BuilderPruneOptions struct {
 	BuildKitHost string
 	// All will remove all unused images and all build cache, not just dangling ones
 	All bool
+	// Force will not prompt for confirmation.
+	Force bool
 }

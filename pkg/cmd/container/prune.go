@@ -22,9 +22,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/sirupsen/logrus"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
 )
 
 // Prune remove all stopped containers
@@ -36,14 +37,14 @@ func Prune(ctx context.Context, client *containerd.Client, options types.Contain
 
 	var deleted []string
 	for _, c := range containers {
-		if err = RemoveContainer(ctx, c, options.GOptions, false, true); err == nil {
+		if err = RemoveContainer(ctx, c, options.GOptions, false, true, client); err == nil {
 			deleted = append(deleted, c.ID())
 			continue
 		}
 		if errors.As(err, &ErrContainerStatus{}) {
 			continue
 		}
-		logrus.WithError(err).Warnf("failed to remove container %s", c.ID())
+		log.G(ctx).WithError(err).Warnf("failed to remove container %s", c.ID())
 	}
 
 	if len(deleted) > 0 {

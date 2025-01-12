@@ -25,15 +25,17 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/nerdctl/pkg/mountutil/volumestore"
 	"github.com/docker/go-units"
 	mobymount "github.com/moby/sys/mount"
 	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
+
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/mountutil/volumestore"
 )
 
 /*
@@ -43,6 +45,15 @@ import (
    Licensed under the Apache License, Version 2.0
    NOTICE: https://github.com/moby/moby/blob/v20.10.5/NOTICE
 */
+
+const (
+	DefaultMountType = "none"
+
+	// DefaultPropagationMode is the default propagation of mounts
+	// where user doesn't specify mount propagation explicitly.
+	// See also: https://github.com/moby/moby/blob/v20.10.7/volume/mounts/linux_parser.go#L145
+	DefaultPropagationMode = "rprivate"
+)
 
 // UnprivilegedMountFlags is from https://github.com/moby/moby/blob/v20.10.5/daemon/oci_linux.go#L420-L450
 //
@@ -77,11 +88,6 @@ func UnprivilegedMountFlags(path string) ([]string, error) {
 
 	return flags, nil
 }
-
-// DefaultPropagationMode is the default propagation of mounts
-// where user doesn't specify mount propagation explicitly.
-// See also: https://github.com/moby/moby/blob/v20.10.7/volume/mounts/linux_parser.go#L145
-const DefaultPropagationMode = "rprivate"
 
 // parseVolumeOptions parses specified optsRaw with using information of
 // the volume type and the src directory when necessary.
@@ -118,7 +124,7 @@ func parseVolumeOptionsWithMountInfo(vType, src, optsRaw string, getMountInfoFun
 		case "":
 			// NOP
 		default:
-			logrus.Warnf("unsupported volume option %q", opt)
+			log.L.Warnf("unsupported volume option %q", opt)
 		}
 	}
 
@@ -144,7 +150,7 @@ func parseVolumeOptionsWithMountInfo(vType, src, optsRaw string, getMountInfoFun
 			// Older version of runc just ignores "rro", so we have to add "ro" too, to our best effort.
 			opts = append(opts, "ro", "rro")
 			if len(propagationRawOpts) != 1 || propagationRawOpts[0] != "rprivate" {
-				logrus.Warn("Mount option \"rro\" should be used in conjunction with \"rprivate\"")
+				log.L.Warn("Mount option \"rro\" should be used in conjunction with \"rprivate\"")
 			}
 		case "rw":
 			// NOP
@@ -418,13 +424,14 @@ func ProcessFlagMount(s string, volStore volumestore.VolumeStore) (*Processed, e
 	}
 	fieldsStr := strings.Join(fields, ":")
 
-	logrus.Debugf("Call legacy %s process, spec: %s ", mountType, fieldsStr)
+	log.L.Debugf("Call legacy %s process, spec: %s ", mountType, fieldsStr)
 
 	switch mountType {
 	case Tmpfs:
 		return ProcessFlagTmpfs(fieldsStr)
 	case Volume, Bind:
-		return ProcessFlagV(fieldsStr, volStore)
+		// createDir=false for --mount option to disallow creating directories on host if not found
+		return ProcessFlagV(fieldsStr, volStore, false)
 	}
 	return nil, fmt.Errorf("invalid mount type '%s' must be a volume/bind/tmpfs", mountType)
 }

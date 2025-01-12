@@ -23,8 +23,9 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/containerd/nerdctl/pkg/labels/k8slabels"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/labels/k8slabels"
 )
 
 // Type alias for functions which write out logs to the provided stdout/stderr Writers.
@@ -37,7 +38,7 @@ var logViewers = make(map[string]LogViewerFunc)
 // Registers a LogViewerFunc for the
 func RegisterLogViewer(driverName string, lvfn LogViewerFunc) {
 	if v, ok := logViewers[driverName]; ok {
-		logrus.Warnf("A LogViewerFunc with name %q has already been registered: %#v, overriding with %#v either way", driverName, v, lvfn)
+		log.L.Warnf("A LogViewerFunc with name %q has already been registered: %#v, overriding with %#v either way", driverName, v, lvfn)
 	}
 	logViewers[driverName] = lvfn
 }
@@ -93,7 +94,7 @@ func (lvo *LogViewOptions) Validate() error {
 		if err != nil {
 			return err
 		}
-		logrus.Warnf("given relative datastore path %q, transformed it to absolute path: %q", lvo.DatastoreRootPath, abs)
+		log.L.Warnf("given relative datastore path %q, transformed it to absolute path: %q", lvo.DatastoreRootPath, abs)
 		lvo.DatastoreRootPath = abs
 	}
 
@@ -132,6 +133,10 @@ func InitContainerLogViewer(containerLabels map[string]string, lvopts LogViewOpt
 
 	if lcfg.Driver == "cri" && !experimental {
 		return nil, fmt.Errorf("the `cri` log viewer requires nerdctl to be running in experimental mode")
+	}
+
+	if lcfg.Driver == "none" {
+		return nil, fmt.Errorf("log type `none` was selected, nothing to log")
 	}
 
 	lv := &ContainerLogViewer{

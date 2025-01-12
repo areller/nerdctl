@@ -23,11 +23,13 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/oci"
-	"github.com/containerd/nerdctl/pkg/labels"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	b4nnoci "github.com/rootless-containers/bypass4netns/pkg/oci"
+
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/oci"
+
+	"github.com/containerd/nerdctl/v2/pkg/annotations"
 )
 
 func generateSecurityOpt(listenerPath string) (oci.SpecOpts, error) {
@@ -46,8 +48,8 @@ func generateSecurityOpt(listenerPath string) (oci.SpecOpts, error) {
 	return opt, nil
 }
 
-func GenerateBypass4netnsOpts(securityOptsMaps map[string]string, labelMaps map[string]string, id string) ([]oci.SpecOpts, error) {
-	b4nn, ok := labelMaps[labels.Bypass4netns]
+func GenerateBypass4netnsOpts(securityOptsMaps map[string]string, annotationsMap map[string]string, id string) ([]oci.SpecOpts, error) {
+	b4nn, ok := annotationsMap[annotations.Bypass4netns]
 	if !ok {
 		return nil, nil
 	}
@@ -129,19 +131,31 @@ func GetPidFilePathByID(id string) (string, error) {
 		return "", err
 	}
 
-	socketPath := filepath.Join(xdgRuntimeDir, "bypass4netns", id[0:15]+".pid")
-	return socketPath, nil
-}
+	pidPath := filepath.Join(xdgRuntimeDir, "bypass4netns", id[0:15]+".pid")
 
-func IsBypass4netnsEnabled(annotations map[string]string) (bool, error) {
-	if b4nn, ok := annotations[labels.Bypass4netns]; ok {
-		b4nnEnable, err := strconv.ParseBool(b4nn)
-		if err != nil {
-			return false, err
-		}
-
-		return b4nnEnable, nil
+	err = os.MkdirAll(filepath.Join(xdgRuntimeDir, "bypass4netns"), 0o700)
+	if err != nil {
+		return "", err
 	}
 
-	return false, nil
+	return pidPath, nil
+}
+
+func IsBypass4netnsEnabled(annotationsMap map[string]string) (enabled, bindEnabled bool, err error) {
+	if b4nn, ok := annotationsMap[annotations.Bypass4netns]; ok {
+		enabled, err = strconv.ParseBool(b4nn)
+		if err != nil {
+			return
+		}
+		bindEnabled = enabled
+		if s, ok := annotationsMap[annotations.Bypass4netnsIgnoreBind]; ok {
+			var bindDisabled bool
+			bindDisabled, err = strconv.ParseBool(s)
+			if err != nil {
+				return
+			}
+			bindEnabled = !bindDisabled
+		}
+	}
+	return
 }

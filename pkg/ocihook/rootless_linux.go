@@ -19,12 +19,14 @@ package ocihook
 import (
 	"context"
 
-	gocni "github.com/containerd/go-cni"
-	"github.com/containerd/nerdctl/pkg/rootlessutil"
-	rlkclient "github.com/rootless-containers/rootlesskit/pkg/api/client"
+	rlkclient "github.com/rootless-containers/rootlesskit/v2/pkg/api/client"
+
+	"github.com/containerd/go-cni"
+
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
 )
 
-func exposePortsRootless(ctx context.Context, rlkClient rlkclient.Client, ports []gocni.PortMapping) error {
+func exposePortsRootless(ctx context.Context, rlkClient rlkclient.Client, ports []cni.PortMapping) error {
 	pm, err := rootlessutil.NewRootlessCNIPortManager(rlkClient)
 	if err != nil {
 		return err
@@ -38,7 +40,7 @@ func exposePortsRootless(ctx context.Context, rlkClient rlkclient.Client, ports 
 	return nil
 }
 
-func unexposePortsRootless(ctx context.Context, rlkClient rlkclient.Client, ports []gocni.PortMapping) error {
+func unexposePortsRootless(ctx context.Context, rlkClient rlkclient.Client, ports []cni.PortMapping) error {
 	pm, err := rootlessutil.NewRootlessCNIPortManager(rlkClient)
 	if err != nil {
 		return err

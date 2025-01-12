@@ -28,19 +28,38 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/images/archive"
-	"github.com/containerd/containerd/platforms"
-	dockerreference "github.com/containerd/containerd/reference/docker"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/buildkitutil"
-	"github.com/containerd/nerdctl/pkg/clientutil"
-	"github.com/containerd/nerdctl/pkg/platformutil"
-	"github.com/containerd/nerdctl/pkg/strutil"
-	"github.com/sirupsen/logrus"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/archive"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/buildkitutil"
+	"github.com/containerd/nerdctl/v2/pkg/clientutil"
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/platformutil"
+	"github.com/containerd/nerdctl/v2/pkg/referenceutil"
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
 )
+
+type PlatformParser interface {
+	Parse(platform string) (platforms.Platform, error)
+	DefaultSpec() platforms.Platform
+}
+
+type platformParser struct{}
+
+func (p platformParser) Parse(platform string) (platforms.Platform, error) {
+	return platforms.Parse(platform)
+}
+
+func (p platformParser) DefaultSpec() platforms.Platform {
+	return platforms.DefaultSpec()
+}
 
 func Build(ctx context.Context, client *containerd.Client, options types.BuilderBuildOptions) error {
 	buildctlBinary, buildctlArgs, needsLoading, metaFile, tags, cleanup, err := generateBuildctlArgs(ctx, client, options)
@@ -51,7 +70,7 @@ func Build(ctx context.Context, client *containerd.Client, options types.Builder
 		defer cleanup()
 	}
 
-	logrus.Debugf("running %s %v", buildctlBinary, buildctlArgs)
+	log.L.Debugf("running %s %v", buildctlBinary, buildctlArgs)
 	buildctlCmd := exec.Command(buildctlBinary, buildctlArgs...)
 	buildctlCmd.Env = os.Environ()
 
@@ -91,13 +110,13 @@ func Build(ctx context.Context, client *containerd.Client, options types.Builder
 		if err != nil {
 			return err
 		}
-		if err := os.WriteFile(options.IidFile, []byte(id), 0600); err != nil {
+		if err := os.WriteFile(options.IidFile, []byte(id), 0644); err != nil {
 			return err
 		}
 	}
 
 	if len(tags) > 1 {
-		logrus.Debug("Found more than 1 tag")
+		log.L.Debug("Found more than 1 tag")
 		imageService := client.ImageService()
 		image, err := imageService.Get(ctx, tags[0])
 		if err != nil {
@@ -108,6 +127,12 @@ func Build(ctx context.Context, client *containerd.Client, options types.Builder
 			if _, err := imageService.Create(ctx, image); err != nil {
 				// if already exists; skip.
 				if errors.Is(err, errdefs.ErrAlreadyExists) {
+					if err = imageService.Delete(ctx, targetRef); err != nil {
+						return err
+					}
+					if _, err = imageService.Create(ctx, image); err != nil {
+						return err
+					}
 					continue
 				}
 				return fmt.Errorf("unable to tag image: %s", err)
@@ -131,8 +156,10 @@ func loadImage(ctx context.Context, in io.Reader, namespace, address, snapshotte
 	if err != nil {
 		return err
 	}
-	defer cancel()
-
+	defer func() {
+		cancel()
+		client.Close()
+	}()
 	r := &readCounter{Reader: in}
 	imgs, err := client.Import(ctx, r, containerd.WithDigestRef(archive.DigestTranslator(snapshotter)), containerd.WithSkipDigestRef(func(name string) bool { return name != "" }), containerd.WithImportPlatform(platMC))
 	if err != nil {
@@ -202,24 +229,26 @@ func generateBuildctlArgs(ctx context.Context, client *containerd.Client, option
 			output = fmt.Sprintf("type=local,dest=%s", output)
 		}
 		if strings.Contains(output, "type=docker") || strings.Contains(output, "type=oci") {
-			needsLoading = true
+			if !strings.Contains(output, "dest=") {
+				needsLoading = true
+			}
 		}
 	}
 	if tags = strutil.DedupeStrSlice(options.Tag); len(tags) > 0 {
 		ref := tags[0]
-		named, err := dockerreference.ParseNormalizedNamed(ref)
+		parsedReference, err := referenceutil.Parse(ref)
 		if err != nil {
 			return "", nil, false, "", nil, nil, err
 		}
-		output += ",name=" + dockerreference.TagNameOnly(named).String()
+		output += ",name=" + parsedReference.String()
 
 		// pick the first tag and add it to output
 		for idx, tag := range tags {
-			named, err := dockerreference.ParseNormalizedNamed(tag)
+			parsedReference, err = referenceutil.Parse(tag)
 			if err != nil {
 				return "", nil, false, "", nil, nil, err
 			}
-			tags[idx] = dockerreference.TagNameOnly(named).String()
+			tags[idx] = parsedReference.String()
 		}
 	} else if len(tags) == 0 {
 		output = output + ",dangling-name-prefix=<none>"
@@ -261,6 +290,38 @@ func generateBuildctlArgs(ctx context.Context, client *containerd.Client, option
 		return "", nil, false, "", nil, nil, err
 	}
 
+	buildCtx, err := parseContextNames(options.ExtendedBuildContext)
+	if err != nil {
+		return "", nil, false, "", nil, nil, err
+	}
+
+	for k, v := range buildCtx {
+		isURL := strings.HasPrefix(v, "https://") || strings.HasPrefix(v, "http://")
+		isDockerImage := strings.HasPrefix(v, "docker-image://") || strings.HasPrefix(v, "target:")
+
+		if isURL || isDockerImage {
+			buildctlArgs = append(buildctlArgs, fmt.Sprintf("--opt=context:%s=%s", k, v))
+			continue
+		}
+
+		if isOCILayout := strings.HasPrefix(v, "oci-layout://"); isOCILayout {
+			args, err := parseBuildContextFromOCILayout(k, v)
+			if err != nil {
+				return "", nil, false, "", nil, nil, err
+			}
+
+			buildctlArgs = append(buildctlArgs, args...)
+			continue
+		}
+
+		path, err := filepath.Abs(v)
+		if err != nil {
+			return "", nil, false, "", nil, nil, err
+		}
+		buildctlArgs = append(buildctlArgs, fmt.Sprintf("--local=%s=%s", k, path))
+		buildctlArgs = append(buildctlArgs, fmt.Sprintf("--opt=context:%s=local:%s", k, k))
+	}
+
 	buildctlArgs = append(buildctlArgs, "--local=dockerfile="+dir)
 	buildctlArgs = append(buildctlArgs, "--opt=filename="+file)
 
@@ -283,7 +344,7 @@ func generateBuildctlArgs(ctx context.Context, client *containerd.Client, option
 			if ok {
 				buildctlArgs = append(buildctlArgs, fmt.Sprintf("--opt=build-arg:%s=%s", ba, val))
 			} else {
-				logrus.Debugf("ignoring unset build arg %q", ba)
+				log.L.Debugf("ignoring unset build arg %q", ba)
 			}
 		} else if len(arr) > 1 && len(arr[0]) > 0 {
 			buildctlArgs = append(buildctlArgs, "--opt=build-arg:"+ba)
@@ -298,7 +359,7 @@ func generateBuildctlArgs(ctx context.Context, client *containerd.Client, option
 						buildctlArgs = append(buildctlArgs, "--export-cache=type=inline")
 					}
 				} else {
-					logrus.WithError(err).Warnf("invalid BUILDKIT_INLINE_CACHE: %q", bic)
+					log.L.WithError(err).Warnf("invalid BUILDKIT_INLINE_CACHE: %q", bic)
 				}
 			}
 		} else {
@@ -322,8 +383,31 @@ func generateBuildctlArgs(ctx context.Context, client *containerd.Client, option
 		buildctlArgs = append(buildctlArgs, "--no-cache")
 	}
 
+	if options.Pull != nil {
+		switch *options.Pull {
+		case true:
+			buildctlArgs = append(buildctlArgs, "--opt=image-resolve-mode=pull")
+		case false:
+			buildctlArgs = append(buildctlArgs, "--opt=image-resolve-mode=local")
+		}
+	}
+
 	for _, s := range strutil.DedupeStrSlice(options.Secret) {
 		buildctlArgs = append(buildctlArgs, "--secret="+s)
+	}
+
+	for _, s := range strutil.DedupeStrSlice(options.Allow) {
+		buildctlArgs = append(buildctlArgs, "--allow="+s)
+	}
+
+	for _, s := range strutil.DedupeStrSlice(options.Attest) {
+		optAttestType, optAttestAttrs, _ := strings.Cut(s, ",")
+		if strings.HasPrefix(optAttestType, "type=") {
+			optAttestType := strings.TrimPrefix(optAttestType, "type=")
+			buildctlArgs = append(buildctlArgs, fmt.Sprintf("--opt=attest:%s=%s", optAttestType, optAttestAttrs))
+		} else {
+			return "", nil, false, "", nil, nil, fmt.Errorf("attestation type not specified")
+		}
 	}
 
 	for _, s := range strutil.DedupeStrSlice(options.SSH) {
@@ -345,7 +429,7 @@ func generateBuildctlArgs(ctx context.Context, client *containerd.Client, option
 	}
 
 	if !options.Rm {
-		logrus.Warn("ignoring deprecated flag: '--rm=false'")
+		log.L.Warn("ignoring deprecated flag: '--rm=false'")
 	}
 
 	if options.IidFile != "" {
@@ -356,6 +440,26 @@ func generateBuildctlArgs(ctx context.Context, client *containerd.Client, option
 		defer file.Close()
 		metaFile = file.Name()
 		buildctlArgs = append(buildctlArgs, "--metadata-file="+metaFile)
+	}
+
+	if options.NetworkMode != "" {
+		switch options.NetworkMode {
+		case "none":
+			buildctlArgs = append(buildctlArgs, "--opt=force-network-mode="+options.NetworkMode)
+		case "host":
+			buildctlArgs = append(buildctlArgs, "--opt=force-network-mode="+options.NetworkMode, "--allow=network.host", "--allow=security.insecure")
+		case "", "default":
+		default:
+			log.L.Debugf("ignoring network build arg %s", options.NetworkMode)
+		}
+	}
+
+	if len(options.ExtraHosts) > 0 {
+		extraHosts, err := containerutil.ParseExtraHosts(options.ExtraHosts, options.GOptions.HostGatewayIP, "=")
+		if err != nil {
+			return "", nil, false, "", nil, nil, err
+		}
+		buildctlArgs = append(buildctlArgs, "--opt=add-hosts="+strings.Join(extraHosts, ","))
 	}
 
 	return buildctlBinary, buildctlArgs, needsLoading, metaFile, tags, cleanup, nil
@@ -370,7 +474,7 @@ func getDigestFromMetaFile(path string) (string, error) {
 
 	metadata := map[string]json.RawMessage{}
 	if err := json.Unmarshal(data, &metadata); err != nil {
-		logrus.WithError(err).Errorf("failed to unmarshal metadata file %s", path)
+		log.L.WithError(err).Errorf("failed to unmarshal metadata file %s", path)
 		return "", err
 	}
 	digestRaw, ok := metadata["containerimage.digest"]
@@ -379,10 +483,33 @@ func getDigestFromMetaFile(path string) (string, error) {
 	}
 	var digest string
 	if err := json.Unmarshal(digestRaw, &digest); err != nil {
-		logrus.WithError(err).Errorf("failed to unmarshal digset")
+		log.L.WithError(err).Errorf("failed to unmarshal digset")
 		return "", err
 	}
 	return digest, nil
+}
+
+func isMatchingRuntimePlatform(platform string, parser PlatformParser) bool {
+	p, err := parser.Parse(platform)
+	if err != nil {
+		return false
+	}
+	d := parser.DefaultSpec()
+
+	if p.OS == d.OS && p.Architecture == d.Architecture && (p.Variant == "" || p.Variant == d.Variant) {
+		return true
+	}
+
+	return false
+}
+
+func isBuildPlatformDefault(platform []string, parser PlatformParser) bool {
+	if len(platform) == 0 {
+		return true
+	} else if len(platform) == 1 {
+		return isMatchingRuntimePlatform(platform[0], parser)
+	}
+	return false
 }
 
 func isImageSharable(buildkitHost, namespace, uuid, snapshotter string, platform []string) (bool, error) {
@@ -390,7 +517,7 @@ func isImageSharable(buildkitHost, namespace, uuid, snapshotter string, platform
 	if err != nil {
 		return false, err
 	}
-	logrus.Debugf("worker labels: %+v", labels)
+	log.L.Debugf("worker labels: %+v", labels)
 	executor, ok := labels["org.mobyproject.buildkit.worker.executor"]
 	if !ok {
 		return false, nil
@@ -411,5 +538,79 @@ func isImageSharable(buildkitHost, namespace, uuid, snapshotter string, platform
 	//       Dockerfile doesn't contain instructions require base images like RUN) even if `--output type=image,unpack=true`
 	//       is passed to BuildKit. Thus, we need to use `type=docker` or `type=oci` when nerdctl builds non-default platform
 	//       image using `platform` option.
-	return executor == "containerd" && containerdUUID == uuid && containerdNamespace == namespace && workerSnapshotter == snapshotter && len(platform) == 0, nil
+	parser := new(platformParser)
+	return executor == "containerd" && containerdUUID == uuid && containerdNamespace == namespace && workerSnapshotter == snapshotter && isBuildPlatformDefault(platform, parser), nil
+}
+
+func parseContextNames(values []string) (map[string]string, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	result := make(map[string]string, len(values))
+	for _, value := range values {
+		kv := strings.SplitN(value, "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("invalid context value: %s, expected key=value", value)
+		}
+		result[kv[0]] = kv[1]
+	}
+	return result, nil
+}
+
+var (
+	ErrOCILayoutPrefixNotFound = errors.New("OCI layout prefix not found")
+	ErrOCILayoutEmptyDigest    = errors.New("OCI layout cannot have empty digest")
+)
+
+func parseBuildContextFromOCILayout(name, path string) ([]string, error) {
+	path, found := strings.CutPrefix(path, "oci-layout://")
+	if !found {
+		return []string{}, ErrOCILayoutPrefixNotFound
+	}
+
+	abspath, err := filepath.Abs(path)
+	if err != nil {
+		return []string{}, err
+	}
+
+	ociIndex, err := readOCIIndexFromPath(abspath)
+	if err != nil {
+		return []string{}, err
+	}
+
+	var digest string
+	for _, manifest := range ociIndex.Manifests {
+		if images.IsManifestType(manifest.MediaType) {
+			digest = manifest.Digest.String()
+		}
+	}
+
+	if digest == "" {
+		return []string{}, ErrOCILayoutEmptyDigest
+	}
+
+	return []string{
+		fmt.Sprintf("--oci-layout=parent-image-key=%s", abspath),
+		fmt.Sprintf("--opt=context:%s=oci-layout:parent-image-key@%s", name, digest),
+	}, nil
+}
+
+func readOCIIndexFromPath(path string) (*ocispec.Index, error) {
+	ociIndexJSONFile, err := os.Open(filepath.Join(path, "index.json"))
+	if err != nil {
+		return nil, err
+	}
+	defer ociIndexJSONFile.Close()
+
+	rawBytes, err := io.ReadAll(ociIndexJSONFile)
+	if err != nil {
+		return nil, err
+	}
+
+	var ociIndex *ocispec.Index
+	err = json.Unmarshal(rawBytes, &ociIndex)
+	if err != nil {
+		return nil, err
+	}
+	return ociIndex, nil
 }

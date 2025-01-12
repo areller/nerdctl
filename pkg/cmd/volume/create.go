@@ -19,23 +19,28 @@ package volume
 import (
 	"fmt"
 
-	"github.com/containerd/containerd/identifiers"
-	"github.com/containerd/nerdctl/pkg/api/types"
-	"github.com/containerd/nerdctl/pkg/strutil"
+	"github.com/docker/docker/pkg/stringid"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
+	"github.com/containerd/nerdctl/v2/pkg/inspecttypes/native"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
 )
 
-func Create(name string, options types.VolumeCreateOptions) error {
-	if err := identifiers.Validate(name); err != nil {
-		return fmt.Errorf("malformed name %s: %w", name, err)
+func Create(name string, options types.VolumeCreateOptions) (*native.Volume, error) {
+	if name == "" {
+		name = stringid.GenerateRandomID()
+		options.Labels = append(options.Labels, labels.AnonymousVolumes+"=")
 	}
 	volStore, err := Store(options.GOptions.Namespace, options.GOptions.DataRoot, options.GOptions.Address)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	labels := strutil.DedupeStrSlice(options.Labels)
-	if _, err := volStore.Create(name, labels); err != nil {
-		return err
+	vol, err := volStore.Create(name, labels)
+	if err != nil {
+		return nil, err
 	}
-	fmt.Fprintf(options.Stdout, "%s\n", name)
-	return nil
+	fmt.Fprintln(options.Stdout, name)
+	return vol, nil
 }

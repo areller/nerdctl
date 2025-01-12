@@ -18,6 +18,7 @@ package logging
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -28,12 +29,16 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/containerd/containerd/runtime/v2/logging"
-	"github.com/containerd/nerdctl/pkg/strutil"
 	"github.com/coreos/go-systemd/v22/journal"
 	"github.com/docker/cli/templates"
 	timetypes "github.com/docker/docker/api/types/time"
-	"github.com/sirupsen/logrus"
+
+	"github.com/containerd/containerd/v2/core/runtime/v2/logging"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/clientutil"
+	"github.com/containerd/nerdctl/v2/pkg/containerutil"
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
 )
 
 var JournalDriverLogOpts = []string{
@@ -43,15 +48,16 @@ var JournalDriverLogOpts = []string{
 func JournalLogOptsValidate(logOptMap map[string]string) error {
 	for key := range logOptMap {
 		if !strutil.InStringSlice(JournalDriverLogOpts, key) {
-			logrus.Warnf("log-opt %s is ignored for journald log driver", key)
+			log.L.Warnf("log-opt %s is ignored for journald log driver", key)
 		}
 	}
 	return nil
 }
 
 type JournaldLogger struct {
-	Opts map[string]string
-	vars map[string]string
+	Opts    map[string]string
+	vars    map[string]string
+	Address string
 }
 
 type identifier struct {
@@ -64,7 +70,7 @@ func (journaldLogger *JournaldLogger) Init(dataStore, ns, id string) error {
 	return nil
 }
 
-func (journaldLogger *JournaldLogger) PreProcess(dataStore string, config *logging.Config) error {
+func (journaldLogger *JournaldLogger) PreProcess(ctx context.Context, dataStore string, config *logging.Config) error {
 	if !journal.Enabled() {
 		return errors.New("the local systemd journal is not available for logging")
 	}
@@ -93,9 +99,37 @@ func (journaldLogger *JournaldLogger) PreProcess(dataStore string, config *loggi
 			syslogIdentifier = b.String()
 		}
 	}
+
+	client, ctx, cancel, err := clientutil.NewClient(ctx, config.Namespace, journaldLogger.Address)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		cancel()
+		client.Close()
+	}()
+	containerID := config.ID
+	container, err := client.LoadContainer(ctx, containerID)
+	if err != nil {
+		return err
+	}
+	containerLabels, err := container.Labels(ctx)
+	if err != nil {
+		return err
+	}
+	containerInfo, err := container.Info(ctx)
+	if err != nil {
+		return err
+	}
+
 	// construct log metadata for the container
 	vars := map[string]string{
 		"SYSLOG_IDENTIFIER": syslogIdentifier,
+		"CONTAINER_TAG":     syslogIdentifier,
+		"CONTAINER_ID":      shortID,
+		"CONTAINER_ID_FULL": containerID,
+		"CONTAINER_NAME":    containerutil.GetContainerName(containerLabels),
+		"IMAGE_NAME":        containerInfo.Image,
 	}
 	journaldLogger.vars = vars
 	return nil
@@ -141,7 +175,7 @@ func FetchLogs(stdout, stderr io.Writer, journalctlArgs []string, stopChannel ch
 	// Setup killing goroutine:
 	go func() {
 		<-stopChannel
-		logrus.Debugf("killing journalctl logs process with PID: %#v", cmd.Process.Pid)
+		log.L.Debugf("killing journalctl logs process with PID: %#v", cmd.Process.Pid)
 		cmd.Process.Kill()
 	}()
 
@@ -172,7 +206,7 @@ func viewLogsJournald(lvopts LogViewOptions, stdout, stderr io.Writer, stopChann
 		journalctlArgs = append(journalctlArgs, "--since", date)
 	}
 	if lvopts.Timestamps {
-		logrus.Warnf("unsupported Timestamps option for journald driver")
+		log.L.Warnf("unsupported Timestamps option for journald driver")
 	}
 	if lvopts.Until != "" {
 		// using GetTimestamp from moby to keep time format consistency

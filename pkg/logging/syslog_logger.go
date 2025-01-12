@@ -17,6 +17,7 @@
 package logging
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -30,9 +31,10 @@ import (
 	"github.com/docker/go-connections/tlsconfig"
 	syslog "github.com/yuchanns/srslog"
 
-	"github.com/containerd/containerd/runtime/v2/logging"
-	"github.com/containerd/nerdctl/pkg/strutil"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/containerd/v2/core/runtime/v2/logging"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
 )
 
 const (
@@ -91,7 +93,7 @@ const (
 func SyslogOptsValidate(logOptMap map[string]string) error {
 	for key := range logOptMap {
 		if !strutil.InStringSlice(syslogOpts, key) {
-			logrus.Warnf("log-opt %s is ignored for syslog log driver", key)
+			log.L.Warnf("log-opt %s is ignored for syslog log driver", key)
 		}
 	}
 	proto, _, err := parseSyslogAddress(logOptMap[syslogAddress])
@@ -121,7 +123,7 @@ func (sy *SyslogLogger) Init(dataStore string, ns string, id string) error {
 	return nil
 }
 
-func (sy *SyslogLogger) PreProcess(dataStore string, config *logging.Config) error {
+func (sy *SyslogLogger) PreProcess(ctx context.Context, dataStore string, config *logging.Config) error {
 	logger, err := parseSyslog(config.ID, sy.Opts)
 	if err != nil {
 		return err

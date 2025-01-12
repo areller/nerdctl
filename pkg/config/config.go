@@ -17,10 +17,10 @@
 package config
 
 import (
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/defaults"
-	"github.com/containerd/containerd/namespaces"
-	ncdefaults "github.com/containerd/nerdctl/pkg/defaults"
+	"github.com/containerd/containerd/v2/defaults"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+
+	ncdefaults "github.com/containerd/nerdctl/v2/pkg/defaults"
 )
 
 // Config corresponds to nerdctl.toml .
@@ -39,6 +39,8 @@ type Config struct {
 	HostsDir         []string `toml:"hosts_dir"`
 	Experimental     bool     `toml:"experimental"`
 	HostGatewayIP    string   `toml:"host_gateway_ip"`
+	BridgeIP         string   `toml:"bridge_ip, omitempty"`
+	KubeHideDupe     bool     `toml:"kube_hide_dupe"`
 }
 
 // New creates a default Config object statically,
@@ -49,7 +51,7 @@ func New() *Config {
 		DebugFull:        false,
 		Address:          defaults.DefaultAddress,
 		Namespace:        namespaces.Default,
-		Snapshotter:      containerd.DefaultSnapshotter,
+		Snapshotter:      defaults.DefaultSnapshotter,
 		CNIPath:          ncdefaults.CNIPath(),
 		CNINetConfPath:   ncdefaults.CNINetConfPath(),
 		DataRoot:         ncdefaults.DataRoot(),
@@ -58,5 +60,6 @@ func New() *Config {
 		HostsDir:         ncdefaults.HostsDirs(),
 		Experimental:     true,
 		HostGatewayIP:    ncdefaults.HostGatewayIP(),
+		KubeHideDupe:     false,
 	}
 }

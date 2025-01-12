@@ -24,7 +24,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/errdefs"
 )
 
 func HTTPGet(urlStr string, attempts int, insecure bool) (*http.Response, error) {
@@ -54,6 +54,7 @@ func HTTPGet(urlStr string, attempts int, insecure bool) (*http.Response, error)
 }
 
 func NonLoopbackIPv4() (net.IP, error) {
+	// no need to use [rootlessutil.WithDetachedNetNSIfAny] here
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		return nil, err

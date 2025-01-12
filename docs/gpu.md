@@ -20,7 +20,7 @@ You can specify number of GPUs to use via `--gpus` option.
 The following example exposes all available GPUs.
 
 ```
-nerdctl run -it --rm --gpus all nvidia/cuda:9.0-base nvidia-smi
+nerdctl run -it --rm --gpus all nvidia/cuda:12.3.1-base-ubuntu20.04 nvidia-smi
 ```
 
 You can also pass detailed configuration to `--gpus` option as a list of key-value pairs. The following options are provided.
@@ -32,7 +32,7 @@ You can also pass detailed configuration to `--gpus` option as a list of key-val
 The following example exposes a specific GPU to the container.
 
 ```
-nerdctl run -it --rm --gpus '"capabilities=utility,compute",device=GPU-3a23c669-1f69-c64e-cf85-44e9b07e7a2a' nvidia/cuda:9.0-base nvidia-smi
+nerdctl run -it --rm --gpus '"capabilities=utility,compute",device=GPU-3a23c669-1f69-c64e-cf85-44e9b07e7a2a' nvidia/cuda:12.3.1-base-ubuntu20.04 nvidia-smi
 ```
 
 ## Fields for `nerdctl compose`
@@ -53,7 +53,7 @@ The following exposes all available GPUs to the container.
 version: "3.8"
 services:
   demo:
-    image: nvidia/cuda:9.0-base
+    image: nvidia/cuda:12.3.1-base-ubuntu20.04
     command: nvidia-smi
     deploy:
       resources:
@@ -62,3 +62,24 @@ services:
           - capabilities: ["utility"]
             count: all
 ```
+
+## Trouble Shooting
+
+### `nerdctl run --gpus` fails when using the Nvidia gpu-operator
+
+If the Nvidia driver is installed by the [gpu-operator](https://github.com/NVIDIA/gpu-operator).The `nerdctl run` will fail with the error message `(FATA[0000] exec: "nvidia-container-cli": executable file not found in $PATH)`.
+
+So, the `nvidia-container-cli` needs to be added to the PATH environment variable.
+
+You can do this by adding the following line to your $HOME/.profile or /etc/profile (for a system-wide installation):
+```
+export PATH=$PATH:/usr/local/nvidia/toolkit
+```
+
+The shared libraries also need to be added to the system.
+```
+echo "/run/nvidia/driver/usr/lib/x86_64-linux-gnu" > /etc/ld.so.conf.d/nvidia.conf
+ldconfig
+```
+
+And then, the `nerdctl run --gpus` can run successfully.

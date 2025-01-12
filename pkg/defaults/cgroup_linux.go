@@ -19,8 +19,9 @@ package defaults
 import (
 	"os"
 
-	"github.com/containerd/cgroups"
-	"github.com/containerd/nerdctl/pkg/rootlessutil"
+	"github.com/containerd/cgroups/v3"
+
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
 )
 
 func IsSystemdAvailable() bool {

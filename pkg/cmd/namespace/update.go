@@ -19,8 +19,9 @@ package namespace
 import (
 	"context"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/api/types"
+	containerd "github.com/containerd/containerd/v2/client"
+
+	"github.com/containerd/nerdctl/v2/pkg/api/types"
 )
 
 func Update(ctx context.Context, client *containerd.Client, namespace string, options types.NamespaceUpdateOptions) error {

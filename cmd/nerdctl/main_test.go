@@ -17,13 +17,14 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
+	"errors"
 	"testing"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/testutil"
-	"gotest.tools/v3/assert"
+	"github.com/containerd/containerd/v2/defaults"
+
+	"github.com/containerd/nerdctl/v2/pkg/testutil"
+	"github.com/containerd/nerdctl/v2/pkg/testutil/nerdtest"
+	"github.com/containerd/nerdctl/v2/pkg/testutil/test"
 )
 
 func TestMain(m *testing.M) {
@@ -32,59 +33,98 @@ func TestMain(m *testing.M) {
 
 // TestUnknownCommand tests https://github.com/containerd/nerdctl/issues/487
 func TestUnknownCommand(t *testing.T) {
-	t.Parallel()
-	base := testutil.NewBase(t)
-	base.Cmd("non-existent-command").AssertFail()
-	base.Cmd("non-existent-command", "info").AssertFail()
-	base.Cmd("system", "non-existent-command").AssertFail()
-	base.Cmd("system", "non-existent-command", "info").AssertFail()
-	base.Cmd("system").AssertOK() // show help without error
-	base.Cmd("system", "info").AssertOutContains("Kernel Version:")
-	base.Cmd("info").AssertOutContains("Kernel Version:")
-}
+	testCase := nerdtest.Setup()
 
-// TestNerdctlConfig validates the configuration precedence [CLI, Env, TOML, Default].
-func TestNerdctlConfig(t *testing.T) {
-	testutil.DockerIncompatible(t)
-	t.Parallel()
-	tomlPath := filepath.Join(t.TempDir(), "nerdctl.toml")
-	err := os.WriteFile(tomlPath, []byte(`
-snapshotter = "dummy-snapshotter-via-toml"
-`), 0400)
-	assert.NilError(t, err)
-	base := testutil.NewBase(t)
+	var unknownSubCommand = errors.New("unknown subcommand")
 
-	// [Default]
-	base.Cmd("info", "-f", "{{.Driver}}").AssertOutExactly(containerd.DefaultSnapshotter + "\n")
-
-	// [TOML, Default]
-	if len(base.Env) == 0 {
-		base.Env = os.Environ()
+	testCase.SubTests = []*test.Case{
+		{
+			Description: "non-existent-command",
+			Command:     test.Command("non-existent-command"),
+			Expected:    test.Expects(1, []error{unknownSubCommand}, nil),
+		},
+		{
+			Description: "non-existent-command info",
+			Command:     test.Command("non-existent-command", "info"),
+			Expected:    test.Expects(1, []error{unknownSubCommand}, nil),
+		},
+		{
+			Description: "system non-existent-command",
+			Command:     test.Command("system", "non-existent-command"),
+			Expected:    test.Expects(1, []error{unknownSubCommand}, nil),
+		},
+		{
+			Description: "system non-existent-command info",
+			Command:     test.Command("system", "non-existent-command", "info"),
+			Expected:    test.Expects(1, []error{unknownSubCommand}, nil),
+		},
+		{
+			Description: "system",
+			Command:     test.Command("system"),
+			Expected:    test.Expects(0, nil, nil),
+		},
+		{
+			Description: "system info",
+			Command:     test.Command("system", "info"),
+			Expected:    test.Expects(0, nil, test.Contains("Kernel Version:")),
+		},
+		{
+			Description: "info",
+			Command:     test.Command("info"),
+			Expected:    test.Expects(0, nil, test.Contains("Kernel Version:")),
+		},
 	}
-	base.Env = append(base.Env, "NERDCTL_TOML="+tomlPath)
-	base.Cmd("info", "-f", "{{.Driver}}").AssertOutExactly("dummy-snapshotter-via-toml\n")
 
-	// [CLI, TOML, Default]
-	base.Cmd("info", "-f", "{{.Driver}}", "--snapshotter=dummy-snapshotter-via-cli").AssertOutExactly("dummy-snapshotter-via-cli\n")
-
-	// [Env, TOML, Default]
-	base.Env = append(base.Env, "CONTAINERD_SNAPSHOTTER=dummy-snapshotter-via-env")
-	base.Cmd("info", "-f", "{{.Driver}}").AssertOutExactly("dummy-snapshotter-via-env\n")
-
-	// [CLI, Env, TOML, Default]
-	base.Cmd("info", "-f", "{{.Driver}}", "--snapshotter=dummy-snapshotter-via-cli").AssertOutExactly("dummy-snapshotter-via-cli\n")
+	testCase.Run(t)
 }
 
-func TestNerdctlConfigBad(t *testing.T) {
-	testutil.DockerIncompatible(t)
-	t.Parallel()
-	tomlPath := filepath.Join(t.TempDir(), "config.toml")
-	err := os.WriteFile(tomlPath, []byte(`
-# containerd config, not nerdctl config
-version = 2
-`), 0400)
-	assert.NilError(t, err)
-	base := testutil.NewBase(t)
-	base.Env = append(base.Env, "NERDCTL_TOML="+tomlPath)
-	base.Cmd("info").AssertFail()
+// TestNerdctlConfig validates the configuration precedence [CLI, Env, TOML, Default] and broken config rejection
+func TestNerdctlConfig(t *testing.T) {
+	testCase := nerdtest.Setup()
+
+	// Docker does not support nerdctl.toml obviously
+	testCase.Require = test.Not(nerdtest.Docker)
+
+	testCase.SubTests = []*test.Case{
+		{
+			Description: "Default",
+			Command:     test.Command("info", "-f", "{{.Driver}}"),
+			Expected:    test.Expects(0, nil, test.Equals(defaults.DefaultSnapshotter+"\n")),
+		},
+		{
+			Description: "TOML > Default",
+			Command:     test.Command("info", "-f", "{{.Driver}}"),
+			Expected:    test.Expects(0, nil, test.Equals("dummy-snapshotter-via-toml\n")),
+			Config:      test.WithConfig(nerdtest.NerdctlToml, `snapshotter = "dummy-snapshotter-via-toml"`),
+		},
+		{
+			Description: "Cli > TOML > Default",
+			Command:     test.Command("info", "-f", "{{.Driver}}", "--snapshotter=dummy-snapshotter-via-cli"),
+			Expected:    test.Expects(0, nil, test.Equals("dummy-snapshotter-via-cli\n")),
+			Config:      test.WithConfig(nerdtest.NerdctlToml, `snapshotter = "dummy-snapshotter-via-toml"`),
+		},
+		{
+			Description: "Env > TOML > Default",
+			Command:     test.Command("info", "-f", "{{.Driver}}"),
+			Env:         map[string]string{"CONTAINERD_SNAPSHOTTER": "dummy-snapshotter-via-env"},
+			Expected:    test.Expects(0, nil, test.Equals("dummy-snapshotter-via-env\n")),
+			Config:      test.WithConfig(nerdtest.NerdctlToml, `snapshotter = "dummy-snapshotter-via-toml"`),
+		},
+		{
+			Description: "Cli > Env > TOML > Default",
+			Command:     test.Command("info", "-f", "{{.Driver}}", "--snapshotter=dummy-snapshotter-via-cli"),
+			Env:         map[string]string{"CONTAINERD_SNAPSHOTTER": "dummy-snapshotter-via-env"},
+			Expected:    test.Expects(0, nil, test.Equals("dummy-snapshotter-via-cli\n")),
+			Config:      test.WithConfig(nerdtest.NerdctlToml, `snapshotter = "dummy-snapshotter-via-toml"`),
+		},
+		{
+			Description: "Broken config",
+			Command:     test.Command("info"),
+			Expected:    test.Expects(1, []error{errors.New("failed to load nerdctl config")}, nil),
+			Config: test.WithConfig(nerdtest.NerdctlToml, `# containerd config, not nerdctl config
+version = 2`),
+		},
+	}
+
+	testCase.Run(t)
 }

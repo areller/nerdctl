@@ -26,11 +26,16 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/runtime/v2/logging"
-	"github.com/sirupsen/logrus"
+	"github.com/fsnotify/fsnotify"
+	"github.com/muesli/cancelreader"
+
+	"github.com/containerd/containerd/v2/core/runtime/v2/logging"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
 )
 
 const (
@@ -44,16 +49,16 @@ const (
 
 type Driver interface {
 	Init(dataStore, ns, id string) error
-	PreProcess(dataStore string, config *logging.Config) error
+	PreProcess(ctx context.Context, dataStore string, config *logging.Config) error
 	Process(stdout <-chan string, stderr <-chan string) error
 	PostProcess() error
 }
 
-type DriverFactory func(map[string]string) (Driver, error)
-type LogOpsValidateFunc func(logOptMap map[string]string) error
+type DriverFactory func(map[string]string, string) (Driver, error)
+type LogOptsValidateFunc func(logOptMap map[string]string) error
 
 var drivers = make(map[string]DriverFactory)
-var driversLogOptsValidateFunctions = make(map[string]LogOpsValidateFunc)
+var driversLogOptsValidateFunctions = make(map[string]LogOptsValidateFunc)
 
 func ValidateLogOpts(logDriver string, logOpts map[string]string) error {
 	if value, ok := driversLogOptsValidateFunctions[logDriver]; ok && value != nil {
@@ -62,7 +67,7 @@ func ValidateLogOpts(logDriver string, logOpts map[string]string) error {
 	return nil
 }
 
-func RegisterDriver(name string, f DriverFactory, validateFunc LogOpsValidateFunc) {
+func RegisterDriver(name string, f DriverFactory, validateFunc LogOptsValidateFunc) {
 	drivers[name] = f
 	driversLogOptsValidateFunctions[name] = validateFunc
 }
@@ -76,25 +81,28 @@ func Drivers() []string {
 	return ss
 }
 
-func GetDriver(name string, opts map[string]string) (Driver, error) {
+func GetDriver(name string, opts map[string]string, address string) (Driver, error) {
 	driverFactory, ok := drivers[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown logging driver %q: %w", name, errdefs.ErrNotFound)
 	}
-	return driverFactory(opts)
+	return driverFactory(opts, address)
 }
 
 func init() {
-	RegisterDriver("json-file", func(opts map[string]string) (Driver, error) {
+	RegisterDriver("none", func(opts map[string]string, address string) (Driver, error) {
+		return &NoneLogger{}, nil
+	}, NoneLogOptsValidate)
+	RegisterDriver("json-file", func(opts map[string]string, address string) (Driver, error) {
 		return &JSONLogger{Opts: opts}, nil
 	}, JSONFileLogOptsValidate)
-	RegisterDriver("journald", func(opts map[string]string) (Driver, error) {
-		return &JournaldLogger{Opts: opts}, nil
+	RegisterDriver("journald", func(opts map[string]string, address string) (Driver, error) {
+		return &JournaldLogger{Opts: opts, Address: address}, nil
 	}, JournalLogOptsValidate)
-	RegisterDriver("fluentd", func(opts map[string]string) (Driver, error) {
+	RegisterDriver("fluentd", func(opts map[string]string, address string) (Driver, error) {
 		return &FluentdLogger{Opts: opts}, nil
 	}, FluentdLogOptsValidate)
-	RegisterDriver("syslog", func(opts map[string]string) (Driver, error) {
+	RegisterDriver("syslog", func(opts map[string]string, address string) (Driver, error) {
 		return &SyslogLogger{Opts: opts}, nil
 	}, SyslogOptsValidate)
 }
@@ -103,7 +111,7 @@ func init() {
 //
 // Should be called only if argv1 == MagicArgv1.
 func Main(argv2 string) error {
-	fn, err := getLoggerFunc(argv2)
+	fn, err := loggerFunc(argv2)
 	if err != nil {
 		return err
 	}
@@ -113,8 +121,10 @@ func Main(argv2 string) error {
 
 // LogConfig is marshalled as "log-config.json"
 type LogConfig struct {
-	Driver string            `json:"driver"`
-	Opts   map[string]string `json:"opts,omitempty"`
+	Driver  string            `json:"driver"`
+	Opts    map[string]string `json:"opts,omitempty"`
+	LogURI  string            `json:"-"`
+	Address string            `json:"address"`
 }
 
 // LogConfigFilePath returns the path of log-config.json
@@ -139,10 +149,25 @@ func LoadLogConfig(dataStore, ns, id string) (LogConfig, error) {
 	return logConfig, nil
 }
 
-func loggingProcessAdapter(driver Driver, dataStore string, config *logging.Config) error {
-	if err := driver.PreProcess(dataStore, config); err != nil {
+func loggingProcessAdapter(ctx context.Context, driver Driver, dataStore string, config *logging.Config) error {
+	if err := driver.PreProcess(ctx, dataStore, config); err != nil {
 		return err
 	}
+
+	stdoutR, err := cancelreader.NewReader(config.Stdout)
+	if err != nil {
+		return err
+	}
+	stderrR, err := cancelreader.NewReader(config.Stderr)
+	if err != nil {
+		return err
+	}
+	go func() {
+		<-ctx.Done() // delivered on SIGTERM
+		stdoutR.Cancel()
+		stderrR.Cancel()
+	}()
+
 	var wg sync.WaitGroup
 	wg.Add(3)
 	stdout := make(chan string, 10000)
@@ -150,18 +175,25 @@ func loggingProcessAdapter(driver Driver, dataStore string, config *logging.Conf
 	processLogFunc := func(reader io.Reader, dataChan chan string) {
 		defer wg.Done()
 		defer close(dataChan)
-		scanner := bufio.NewScanner(reader)
-		for scanner.Scan() {
-			if scanner.Err() != nil {
-				logrus.Errorf("failed to read log: %v", scanner.Err())
-				return
+		r := bufio.NewReader(reader)
+
+		var err error
+
+		for err == nil {
+			var s string
+			s, err = r.ReadString('\n')
+
+			if len(s) > 0 {
+				dataChan <- strings.TrimSuffix(s, "\n")
 			}
-			dataChan <- scanner.Text()
+
+			if err != nil && err != io.EOF {
+				log.L.WithError(err).Error("failed to read log")
+			}
 		}
 	}
-
-	go processLogFunc(config.Stdout, stdout)
-	go processLogFunc(config.Stderr, stderr)
+	go processLogFunc(stdoutR, stdout)
+	go processLogFunc(stderrR, stderr)
 	go func() {
 		defer wg.Done()
 		driver.Process(stdout, stderr)
@@ -170,11 +202,11 @@ func loggingProcessAdapter(driver Driver, dataStore string, config *logging.Conf
 	return driver.PostProcess()
 }
 
-func getLoggerFunc(dataStore string) (logging.LoggerFunc, error) {
+func loggerFunc(dataStore string) (logging.LoggerFunc, error) {
 	if dataStore == "" {
 		return nil, errors.New("got empty data store")
 	}
-	return func(_ context.Context, config *logging.Config, ready func() error) error {
+	return func(ctx context.Context, config *logging.Config, ready func() error) error {
 		if config.Namespace == "" || config.ID == "" {
 			return errors.New("got invalid config")
 		}
@@ -184,7 +216,7 @@ func getLoggerFunc(dataStore string) (logging.LoggerFunc, error) {
 			if err != nil {
 				return err
 			}
-			driver, err := GetDriver(logConfig.Driver, logConfig.Opts)
+			driver, err := GetDriver(logConfig.Driver, logConfig.Opts, logConfig.Address)
 			if err != nil {
 				return err
 			}
@@ -192,11 +224,53 @@ func getLoggerFunc(dataStore string) (logging.LoggerFunc, error) {
 				return err
 			}
 
-			return loggingProcessAdapter(driver, dataStore, config)
+			return loggingProcessAdapter(ctx, driver, dataStore, config)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			// the file does not exist if the container was created with nerdctl < 0.20
 			return err
 		}
 		return nil
 	}, nil
+}
+
+func NewLogFileWatcher(dir string) (*fsnotify.Watcher, error) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create fsnotify watcher: %v", err)
+	}
+	if err = watcher.Add(dir); err != nil {
+		watcher.Close()
+		return nil, fmt.Errorf("failed to watch directory %q: %w", dir, err)
+	}
+	return watcher, nil
+}
+
+// startTail wait for the next log write.
+// the boolean value indicates if the log file was recreated;
+// the error is error happens during waiting new logs.
+func startTail(ctx context.Context, logName string, w *fsnotify.Watcher) (bool, error) {
+	errRetry := 5
+	for {
+		select {
+		case <-ctx.Done():
+			return false, fmt.Errorf("context cancelled")
+		case e := <-w.Events:
+			switch {
+			case e.Has(fsnotify.Write):
+				return false, nil
+			case e.Has(fsnotify.Create):
+				return filepath.Base(e.Name) == logName, nil
+			default:
+				log.L.Debugf("Received unexpected fsnotify event: %v, retrying", e)
+			}
+		case err := <-w.Errors:
+			log.L.Debugf("Received fsnotify watch error, retrying unless no more retries left, retries: %d, error: %s", errRetry, err)
+			if errRetry == 0 {
+				return false, err
+			}
+			errRetry--
+		case <-time.After(logForceCheckPeriod):
+			return false, nil
+		}
+	}
 }

@@ -20,10 +20,10 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/containerd/nerdctl/pkg/labels"
-	"github.com/containerd/nerdctl/pkg/reflectutil"
+	"github.com/containerd/log"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
+	"github.com/containerd/nerdctl/v2/pkg/reflectutil"
 )
 
 func (c *Composer) upVolume(ctx context.Context, shortName string) error {
@@ -31,22 +31,25 @@ func (c *Composer) upVolume(ctx context.Context, shortName string) error {
 	if !ok {
 		return fmt.Errorf("invalid volume name %q", shortName)
 	}
-	if vol.External.External {
+	if vol.External {
 		// NOP
 		return nil
 	}
 
 	if unknown := reflectutil.UnknownNonEmptyFields(&vol, "Name"); len(unknown) > 0 {
-		logrus.Warnf("Ignoring: volume %s: %+v", shortName, unknown)
+		log.G(ctx).Warnf("Ignoring: volume %s: %+v", shortName, unknown)
 	}
 
 	// shortName is like "db_data", fullName is like "compose-wordpress_db_data"
 	fullName := vol.Name
+	// FIXME: this is racy. By the time we get below to creating the volume, there is no guarantee that things are still fine.
+	// Furthermore, by the time we are done creating all the volumes, they may very well have been destroyed.
+	// This cannot be fixed without getting rid of the whole "shell-out" approach entirely.
 	volExists, err := c.VolumeExists(fullName)
 	if err != nil {
 		return err
 	} else if !volExists {
-		logrus.Infof("Creating volume %s", fullName)
+		log.G(ctx).Infof("Creating volume %s", fullName)
 		//add metadata labels to volume https://github.com/compose-spec/compose-spec/blob/master/spec.md#labels-2
 		createArgs := []string{
 			fmt.Sprintf("--label=%s=%s", labels.ComposeProject, c.project.Name),

@@ -22,34 +22,35 @@ import (
 	"net"
 	"strings"
 
-	gocni "github.com/containerd/go-cni"
-	"github.com/containerd/nerdctl/pkg/labels"
-	"github.com/containerd/nerdctl/pkg/rootlessutil"
 	"github.com/docker/go-connections/nat"
-	"github.com/sirupsen/logrus"
+
+	"github.com/containerd/go-cni"
+	"github.com/containerd/log"
+
+	"github.com/containerd/nerdctl/v2/pkg/labels"
+	"github.com/containerd/nerdctl/v2/pkg/rootlessutil"
 )
 
 // return respectively ip, hostPort, containerPort
 func splitParts(rawport string) (string, string, string) {
-	parts := strings.Split(rawport, ":")
-	n := len(parts)
-	containerport := parts[n-1]
-
-	switch n {
-	case 1:
-		return "", "", containerport
-	case 2:
-		return "", parts[0], containerport
-	case 3:
-		return parts[0], parts[1], containerport
-	default:
-		return strings.Join(parts[:n-2], ":"), parts[n-2], containerport
+	lastIndex := strings.LastIndex(rawport, ":")
+	containerPort := rawport[lastIndex+1:]
+	if lastIndex == -1 {
+		return "", "", containerPort
 	}
+
+	hostAddrPort := rawport[:lastIndex]
+	addr, port, err := net.SplitHostPort(hostAddrPort)
+	if err != nil {
+		return "", hostAddrPort, containerPort
+	}
+
+	return addr, port, containerPort
 }
 
 // ParseFlagP parse port mapping pair, like "127.0.0.1:3000:8080/tcp",
 // "127.0.0.1:3000-3001:8080-8081/tcp" and "3000:8080" ...
-func ParseFlagP(s string) ([]gocni.PortMapping, error) {
+func ParseFlagP(s string) ([]cni.PortMapping, error) {
 	proto := "tcp"
 	splitBySlash := strings.Split(s, "/")
 	switch len(splitBySlash) {
@@ -66,11 +67,11 @@ func ParseFlagP(s string) ([]gocni.PortMapping, error) {
 		return nil, fmt.Errorf("failed to parse %q, unexpected slashes", s)
 	}
 
-	res := gocni.PortMapping{
+	res := cni.PortMapping{
 		Protocol: proto,
 	}
 
-	mr := []gocni.PortMapping{}
+	mr := []cni.PortMapping{}
 
 	ip, hostPort, containerPort := splitParts(splitBySlash[0])
 
@@ -94,7 +95,7 @@ func ParseFlagP(s string) ([]gocni.PortMapping, error) {
 		if err != nil {
 			return nil, err
 		}
-		logrus.Debugf("There is no hostPort has been spec in command, the auto allocate port is from %d:%d to %d:%d", startHostPort, startPort, endHostPort, endPort)
+		log.L.Debugf("There is no hostPort has been spec in command, the auto allocate port is from %d:%d to %d:%d", startHostPort, startPort, endHostPort, endPort)
 	} else {
 		startHostPort, endHostPort, err = nat.ParsePortRange(hostPort)
 		if err != nil {
@@ -129,13 +130,13 @@ func ParseFlagP(s string) ([]gocni.PortMapping, error) {
 }
 
 // ParsePortsLabel parses JSON-marshalled string from label map
-// (under `labels.Ports` key) and returns []gocni.PortMapping.
-func ParsePortsLabel(labelMap map[string]string) ([]gocni.PortMapping, error) {
+// (under `labels.Ports` key) and returns []cni.PortMapping.
+func ParsePortsLabel(labelMap map[string]string) ([]cni.PortMapping, error) {
 	portsJSON := labelMap[labels.Ports]
 	if portsJSON == "" {
-		return []gocni.PortMapping{}, nil
+		return []cni.PortMapping{}, nil
 	}
-	var ports []gocni.PortMapping
+	var ports []cni.PortMapping
 	if err := json.Unmarshal([]byte(portsJSON), &ports); err != nil {
 		return nil, fmt.Errorf("failed to parse label %q=%q: %s", labels.Ports, portsJSON, err.Error())
 	}

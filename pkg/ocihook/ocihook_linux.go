@@ -17,11 +17,11 @@
 package ocihook
 
 import (
-	"github.com/containerd/containerd/contrib/apparmor"
-	"github.com/containerd/nerdctl/pkg/apparmorutil"
-	"github.com/containerd/nerdctl/pkg/defaults"
+	"github.com/containerd/containerd/v2/contrib/apparmor"
+	"github.com/containerd/log"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/nerdctl/v2/pkg/apparmorutil"
+	"github.com/containerd/nerdctl/v2/pkg/defaults"
 )
 
 func loadAppArmor() {
@@ -30,7 +30,7 @@ func loadAppArmor() {
 	}
 	// ensure that the default profile is loaded to the host
 	if err := apparmor.LoadDefaultProfile(defaults.AppArmorProfileName); err != nil {
-		logrus.WithError(err).Errorf("failed to load AppArmor profile %q", defaults.AppArmorProfileName)
+		log.L.WithError(err).Errorf("failed to load AppArmor profile %q", defaults.AppArmorProfileName)
 		// We do not abort here. This is by design, and not a security issue.
 		//
 		// If the container is configured to use the default AppArmor profile

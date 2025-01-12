@@ -21,12 +21,12 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/nerdctl/pkg/composer/serviceparser"
-	"github.com/containerd/nerdctl/pkg/labels"
-	"github.com/containerd/nerdctl/pkg/strutil"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/log"
 
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/nerdctl/v2/pkg/composer/serviceparser"
+	"github.com/containerd/nerdctl/v2/pkg/labels"
+	"github.com/containerd/nerdctl/v2/pkg/strutil"
 )
 
 // StopOptions stores all option input from `nerdctl compose stop`
@@ -68,14 +68,14 @@ func (c *Composer) stopContainers(ctx context.Context, containers []containerd.C
 		go func() {
 			defer rmWG.Done()
 			info, _ := container.Info(ctx, containerd.WithoutRefreshedMetadata)
-			logrus.Infof("Stopping container %s", info.Labels[labels.Name])
+			log.G(ctx).Infof("Stopping container %s", info.Labels[labels.Name])
 			args := []string{"stop"}
 			if opt.Timeout != nil {
 				args = append(args, timeoutArg)
 			}
 			args = append(args, container.ID())
 			if err := c.runNerdctlCmd(ctx, args...); err != nil {
-				logrus.Warn(err)
+				log.G(ctx).Warn(err)
 			}
 		}()
 	}
@@ -92,9 +92,9 @@ func (c *Composer) stopContainersFromParsedServices(ctx context.Context, contain
 		rmWG.Add(1)
 		go func() {
 			defer rmWG.Done()
-			logrus.Infof("Stopping container %s", container.Name)
+			log.G(ctx).Infof("Stopping container %s", container.Name)
 			if err := c.runNerdctlCmd(ctx, "stop", id); err != nil {
-				logrus.Warn(err)
+				log.G(ctx).Warn(err)
 			}
 		}()
 	}
